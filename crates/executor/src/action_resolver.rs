@@ -5,8 +5,15 @@ use tokio::sync::Mutex;
 /// Represents the type of a GitHub Action as declared in its action.yml `runs.using` field.
 #[derive(Debug, Clone)]
 pub enum ActionType {
-    Node { version: u32 },
-    Docker { image: String },
+    Node {
+        version: u32,
+    },
+    /// A Docker action that references a registry image (e.g., `rust:latest`).
+    Docker {
+        image: String,
+    },
+    /// A Docker action that bundles its own Dockerfile and needs to be built.
+    DockerBuild,
     Composite,
 }
 
@@ -21,6 +28,14 @@ pub struct ResolvedAction {
 /// In-memory cache for resolved actions keyed by "owner/repo@version".
 static ACTION_CACHE: Lazy<Mutex<HashMap<String, Option<ResolvedAction>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Shared HTTP client to avoid repeated TLS initialization.
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .expect("Failed to create HTTP client")
+});
 
 /// Fetch and parse `action.yml` (or `action.yaml`) from a remote GitHub repository.
 ///
@@ -64,12 +79,7 @@ async fn fetch_and_parse(
         repo, version, filename
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
-    let mut request = client.get(&url);
+    let mut request = HTTP_CLIENT.get(&url);
 
     // Use GITHUB_TOKEN if available for private repos / rate limiting
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
@@ -127,8 +137,21 @@ fn parse_using(using: &str, runs: &serde_yaml::Value) -> Result<ActionType, Stri
                 .ok_or_else(|| "Docker action missing 'runs.image' field".to_string())?;
 
             // Strip "docker://" prefix if present (some actions use it, some don't)
-            let image = image.trim_start_matches("docker://").to_string();
-            Ok(ActionType::Docker { image })
+            let image = image.trim_start_matches("docker://");
+
+            // If the image is "Dockerfile" or a relative path, it means the action
+            // bundles its own Dockerfile that needs to be built — not pulled from a registry.
+            if image == "Dockerfile"
+                || image.starts_with("./")
+                || image.starts_with("../")
+                || image.ends_with("/Dockerfile")
+            {
+                Ok(ActionType::DockerBuild)
+            } else {
+                Ok(ActionType::Docker {
+                    image: image.to_string(),
+                })
+            }
         }
 
         s if s.starts_with("node") => {
@@ -142,11 +165,15 @@ fn parse_using(using: &str, runs: &serde_yaml::Value) -> Result<ActionType, Stri
 }
 
 /// Return the appropriate Docker image for a resolved action type.
-pub fn image_for_action(action_type: &ActionType) -> String {
+///
+/// Returns `None` for action types that cannot be mapped to a pullable image
+/// (e.g., `DockerBuild` actions that need their Dockerfile built from the repo).
+pub fn image_for_action(action_type: &ActionType) -> Option<String> {
     match action_type {
-        ActionType::Node { version } => format!("node:{}-slim", version),
-        ActionType::Docker { image } => image.clone(),
-        ActionType::Composite => "composite".to_string(),
+        ActionType::Node { version } => Some(format!("node:{}-slim", version)),
+        ActionType::Docker { image } => Some(image.clone()),
+        ActionType::Composite => Some("composite".to_string()),
+        ActionType::DockerBuild => None,
     }
 }
 
@@ -185,7 +212,7 @@ runs:
     }
 
     #[test]
-    fn test_parse_docker_action_without_prefix() {
+    fn test_parse_docker_action_with_dockerfile() {
         let yaml = r#"
 name: 'Docker Action'
 runs:
@@ -193,10 +220,27 @@ runs:
   image: 'Dockerfile'
 "#;
         let resolved = parse_action_definition(yaml).unwrap();
-        match &resolved.action_type {
-            ActionType::Docker { image } => assert_eq!(image, "Dockerfile"),
-            other => panic!("Expected Docker action, got {:?}", other),
-        }
+        assert!(
+            matches!(resolved.action_type, ActionType::DockerBuild),
+            "Expected DockerBuild, got {:?}",
+            resolved.action_type
+        );
+    }
+
+    #[test]
+    fn test_parse_docker_action_with_relative_dockerfile() {
+        let yaml = r#"
+name: 'Docker Action'
+runs:
+  using: 'docker'
+  image: './docker/Dockerfile'
+"#;
+        let resolved = parse_action_definition(yaml).unwrap();
+        assert!(
+            matches!(resolved.action_type, ActionType::DockerBuild),
+            "Expected DockerBuild, got {:?}",
+            resolved.action_type
+        );
     }
 
     #[test]
@@ -224,11 +268,11 @@ name: 'Bad Action'
     fn test_image_for_node() {
         assert_eq!(
             image_for_action(&ActionType::Node { version: 20 }),
-            "node:20-slim"
+            Some("node:20-slim".to_string())
         );
         assert_eq!(
             image_for_action(&ActionType::Node { version: 16 }),
-            "node:16-slim"
+            Some("node:16-slim".to_string())
         );
     }
 
@@ -238,12 +282,98 @@ name: 'Bad Action'
             image_for_action(&ActionType::Docker {
                 image: "rust:latest".to_string()
             }),
-            "rust:latest"
+            Some("rust:latest".to_string())
         );
     }
 
     #[test]
     fn test_image_for_composite() {
-        assert_eq!(image_for_action(&ActionType::Composite), "composite");
+        assert_eq!(
+            image_for_action(&ActionType::Composite),
+            Some("composite".to_string())
+        );
+    }
+
+    #[test]
+    fn test_image_for_docker_build() {
+        assert_eq!(image_for_action(&ActionType::DockerBuild), None);
+    }
+
+    #[test]
+    fn test_parse_node16_action() {
+        let yaml = r#"
+name: 'Legacy Node Action'
+runs:
+  using: 'node16'
+  main: 'index.js'
+"#;
+        let resolved = parse_action_definition(yaml).unwrap();
+        match resolved.action_type {
+            ActionType::Node { version } => assert_eq!(version, 16),
+            other => panic!("Expected Node 16, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_unknown_using_value() {
+        let yaml = r#"
+name: 'Unknown Action'
+runs:
+  using: 'python3'
+"#;
+        let err = parse_action_definition(yaml).unwrap_err();
+        assert!(err.contains("Unknown runs.using value"));
+    }
+
+    #[test]
+    fn test_parse_missing_using_field() {
+        let yaml = r#"
+name: 'Bad Action'
+runs:
+  main: 'index.js'
+"#;
+        let err = parse_action_definition(yaml).unwrap_err();
+        assert!(err.contains("runs.using"));
+    }
+
+    #[test]
+    fn test_parse_docker_missing_image() {
+        let yaml = r#"
+name: 'Bad Docker Action'
+runs:
+  using: 'docker'
+"#;
+        let err = parse_action_definition(yaml).unwrap_err();
+        assert!(err.contains("runs.image"));
+    }
+
+    #[test]
+    fn test_parse_docker_with_docker_prefix_and_dockerfile() {
+        let yaml = r#"
+name: 'Docker Action'
+runs:
+  using: 'docker'
+  image: 'docker://Dockerfile'
+"#;
+        let resolved = parse_action_definition(yaml).unwrap();
+        assert!(
+            matches!(resolved.action_type, ActionType::DockerBuild),
+            "docker://Dockerfile should be DockerBuild, got {:?}",
+            resolved.action_type
+        );
+    }
+
+    #[test]
+    fn test_resolved_action_has_definition() {
+        let yaml = r#"
+name: 'My Action'
+description: 'Test'
+runs:
+  using: 'node20'
+  main: 'index.js'
+"#;
+        let resolved = parse_action_definition(yaml).unwrap();
+        let def = resolved.definition.unwrap();
+        assert_eq!(def.get("name").unwrap().as_str().unwrap(), "My Action");
     }
 }

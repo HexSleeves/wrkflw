@@ -579,12 +579,18 @@ async fn prepare_action(
     if !action.repository.is_empty() && !action.version.is_empty() {
         match action_resolver::resolve_remote_action(&action.repository, &action.version).await {
             Ok(resolved) => {
-                let image = action_resolver::image_for_action(&resolved.action_type);
+                if let Some(image) = action_resolver::image_for_action(&resolved.action_type) {
+                    wrkflw_logging::info(&format!(
+                        "🔄 Resolved action '{}' -> image '{}'",
+                        action.repository, image
+                    ));
+                    return Ok(image);
+                }
+                // DockerBuild: action bundles its own Dockerfile, fall back to hardcoded mapping
                 wrkflw_logging::info(&format!(
-                    "🔄 Resolved action '{}' -> image '{}'",
-                    action.repository, image
+                    "🔄 Action '{}' bundles a Dockerfile. Falling back to built-in mapping.",
+                    action.repository
                 ));
-                return Ok(image);
             }
             Err(e) => {
                 wrkflw_logging::warning(&format!(
@@ -1230,7 +1236,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     })?;
                     let repo_url = format!("https://github.com/{}.git", action_info.repository);
                     let repo_dir = tempdir.path().join("action");
-                    let status = Command::new("git")
+                    let output = Command::new("git")
                         .arg("clone")
                         .arg("--depth")
                         .arg("1")
@@ -1239,15 +1245,18 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         .arg(&repo_url)
                         .arg(&repo_dir)
                         .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
+                        .stderr(std::process::Stdio::piped())
+                        .output()
                         .map_err(|e| {
                             ExecutionError::Execution(format!("Failed to execute git: {}", e))
                         })?;
-                    if !status.success() {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
                         return Err(ExecutionError::Execution(format!(
-                            "Failed to clone composite action {}@{}",
-                            action_info.repository, action_info.version
+                            "Failed to clone composite action {}@{}: {}",
+                            action_info.repository,
+                            action_info.version,
+                            stderr.trim()
                         )));
                     }
                     execute_composite_action(

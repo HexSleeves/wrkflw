@@ -195,9 +195,80 @@ fn normalize_triggers(on_value: &serde_yaml::Value) -> Result<Vec<String>, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::parse_workflow;
+    use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolve_action_parses_version() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("actions/checkout@v4");
+        assert_eq!(info.repository, "actions/checkout");
+        assert_eq!(info.version, "v4");
+        assert!(!info.is_docker);
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_defaults_version_to_main() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("owner/repo");
+        assert_eq!(info.repository, "owner/repo");
+        assert_eq!(info.version, "main");
+    }
+
+    #[test]
+    fn resolve_action_docker_reference() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("docker://alpine:3.18");
+        assert_eq!(info.repository, "docker://alpine:3.18");
+        assert_eq!(info.version, "main");
+        assert!(info.is_docker);
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_local_path() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("./my-action");
+        assert_eq!(info.repository, "./my-action");
+        assert_eq!(info.version, "main");
+        assert!(!info.is_docker);
+        assert!(info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_with_sha_version() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675");
+        assert_eq!(info.repository, "actions/checkout");
+        assert_eq!(info.version, "a81bbbf8298c0fa03ea29cdc473d45769f953675");
+    }
 
     #[test]
     fn parse_workflow_allows_null_workflow_dispatch_with_other_triggers() {
