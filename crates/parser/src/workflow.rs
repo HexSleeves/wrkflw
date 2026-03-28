@@ -117,26 +117,41 @@ pub struct Step {
 impl WorkflowDefinition {
     pub fn resolve_action(&self, action_ref: &str) -> ActionInfo {
         // Parse GitHub action reference like "actions/checkout@v3"
-        let parts: Vec<&str> = action_ref.split('@').collect();
+        let is_docker = action_ref.starts_with("docker://");
+        let is_local = action_ref.starts_with("./");
 
-        let is_docker = parts[0].starts_with("docker://");
-        let is_local = parts[0].starts_with("./");
+        // Docker references can contain `@sha256:digest` (e.g., `docker://alpine@sha256:abc`).
+        // Don't split on `@` for Docker refs — the full string is the image reference.
+        // Local paths also never have a meaningful `@version`.
+        if is_docker {
+            return ActionInfo {
+                repository: action_ref.to_string(),
+                version: String::new(),
+                is_docker: true,
+                is_local: false,
+            };
+        }
+        if is_local {
+            return ActionInfo {
+                repository: action_ref.to_string(),
+                version: String::new(),
+                is_docker: false,
+                is_local: true,
+            };
+        }
 
-        // Docker references (docker://image:tag) embed the tag in the repository
-        // string itself, not via @version, so version is empty for them.
-        let (repo, version) = if parts.len() > 1 {
-            (parts[0], parts[1])
-        } else if is_docker || is_local {
-            (parts[0], "")
+        // For GitHub action references, split on the first `@` to get repo and version.
+        let (repo, version) = if let Some(at_pos) = action_ref.find('@') {
+            (&action_ref[..at_pos], &action_ref[at_pos + 1..])
         } else {
-            (parts[0], "main") // Default to main if no version specified
+            (action_ref, "main") // Default to main if no version specified
         };
 
         ActionInfo {
             repository: repo.to_string(),
             version: version.to_string(),
-            is_docker,
-            is_local,
+            is_docker: false,
+            is_local: false,
         }
     }
 }
@@ -262,6 +277,22 @@ mod tests {
         assert_eq!(info.version, "");
         assert!(!info.is_docker);
         assert!(info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_docker_with_digest() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        // Docker image references can use @sha256:digest — the full string is the image ref
+        let info = wd.resolve_action("docker://alpine@sha256:abcdef1234567890");
+        assert_eq!(info.repository, "docker://alpine@sha256:abcdef1234567890");
+        assert_eq!(info.version, "");
+        assert!(info.is_docker);
+        assert!(!info.is_local);
     }
 
     #[test]

@@ -81,6 +81,20 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to create HTTP client")
 });
 
+/// Shared no-redirect HTTP client for authenticated requests.
+/// Prevents leaking the GITHUB_TOKEN to redirect targets (e.g., CDN hosts).
+/// Reused across requests to avoid per-request TLS initialization.
+static NO_REDIRECT_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("wrkflw")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Failed to create no-redirect HTTP client")
+});
+
+const GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com";
+
 /// Fetch and parse `action.yml` (or `action.yaml`) from a remote GitHub repository.
 ///
 /// Returns `Ok(ResolvedAction)` on success, or `Err` if the action metadata cannot be
@@ -97,14 +111,16 @@ pub async fn resolve_remote_action(repo: &str, version: &str) -> Result<Resolved
     }
 
     // Try action.yml first, then action.yaml
-    let result = match fetch_and_parse(repo, version, "action.yml").await {
+    let result = match fetch_and_parse(GITHUB_RAW_BASE_URL, repo, version, "action.yml").await {
         Ok(resolved) => Ok(resolved),
-        Err(yml_err) => fetch_and_parse(repo, version, "action.yaml").await.map_err(|yaml_err| {
-            format!(
-                "Neither action.yml ({}) nor action.yaml ({}) could be resolved",
-                yml_err, yaml_err
-            )
-        }),
+        Err(yml_err) => fetch_and_parse(GITHUB_RAW_BASE_URL, repo, version, "action.yaml")
+            .await
+            .map_err(|yaml_err| {
+                format!(
+                    "Neither action.yml ({}) nor action.yaml ({}) could be resolved",
+                    yml_err, yaml_err
+                )
+            }),
     };
 
     // Only cache successful resolutions — transient failures should be retryable
@@ -117,14 +133,12 @@ pub async fn resolve_remote_action(repo: &str, version: &str) -> Result<Resolved
 }
 
 async fn fetch_and_parse(
+    base_url: &str,
     repo: &str,
     version: &str,
     filename: &str,
 ) -> Result<ResolvedAction, String> {
-    let url = format!(
-        "https://raw.githubusercontent.com/{}/{}/{}",
-        repo, version, filename
-    );
+    let url = format!("{}/{}/{}/{}", base_url, repo, version, filename);
 
     // Try unauthenticated first; only send GITHUB_TOKEN on 404 (private repos).
     let response = HTTP_CLIENT
@@ -133,52 +147,45 @@ async fn fetch_and_parse(
         .await
         .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
 
-    let response = if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Retry with auth if token is available — the repo may be private.
-        // Use a no-redirect client to prevent leaking the token to a non-GitHub host.
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            let no_redirect_client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .user_agent("wrkflw")
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-            let auth_response = no_redirect_client
-                .get(&url)
-                .header("Authorization", format!("token {}", token))
-                .send()
-                .await
-                .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
+    let response =
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // Retry with auth if token is available — the repo may be private.
+            // NO_REDIRECT_CLIENT prevents leaking the token to a non-GitHub host.
+            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                let auth_response = NO_REDIRECT_CLIENT
+                    .get(&url)
+                    .header("Authorization", format!("token {}", token))
+                    .send()
+                    .await
+                    .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
 
-            // The no-redirect policy prevents token leakage, but the server may
-            // legitimately redirect (CDN routing). If we get a 3xx, follow it
-            // without the auth header to avoid leaking the token.
-            if auth_response.status().is_redirection() {
-                if let Some(location) = auth_response.headers().get(reqwest::header::LOCATION) {
-                    let redirect_url = location
-                        .to_str()
-                        .map_err(|_| "Invalid redirect URL encoding".to_string())?;
-                    HTTP_CLIENT
-                        .get(redirect_url)
-                        .send()
-                        .await
-                        .map_err(|e| format!("Failed to follow redirect {}: {}", redirect_url, e))?
+                // The no-redirect policy prevents token leakage, but the server may
+                // legitimately redirect (CDN routing). If we get a 3xx, follow it
+                // without the auth header to avoid leaking the token.
+                if auth_response.status().is_redirection() {
+                    if let Some(location) = auth_response.headers().get(reqwest::header::LOCATION) {
+                        let redirect_url = location
+                            .to_str()
+                            .map_err(|_| "Invalid redirect URL encoding".to_string())?;
+                        HTTP_CLIENT.get(redirect_url).send().await.map_err(|e| {
+                            format!("Failed to follow redirect {}: {}", redirect_url, e)
+                        })?
+                    } else {
+                        return Err(format!(
+                            "HTTP {} (redirect with no Location header) fetching {}",
+                            auth_response.status(),
+                            url
+                        ));
+                    }
                 } else {
-                    return Err(format!(
-                        "HTTP {} (redirect with no Location header) fetching {}",
-                        auth_response.status(),
-                        url
-                    ));
+                    auth_response
                 }
             } else {
-                auth_response
+                response
             }
         } else {
             response
-        }
-    } else {
-        response
-    };
+        };
 
     if !response.status().is_success() {
         return Err(format!("HTTP {} fetching {}", response.status(), url));
@@ -504,6 +511,165 @@ runs:
         match &cache.get("owner/repo@v1").unwrap().action_type {
             ActionType::Node { version } => assert_eq!(*version, 16),
             other => panic!("Expected Node, got {:?}", other),
+        }
+    }
+
+    /// Tests for `fetch_and_parse` HTTP behavior using wiremock.
+    ///
+    /// All tests that modify `GITHUB_TOKEN` are serialized via `ENV_MUTEX`
+    /// to prevent races between parallel test threads.
+    mod fetch_tests {
+        use super::super::*;
+        use std::sync::Mutex;
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+        const ACTION_YML_BODY: &str =
+            "name: Test Action\nruns:\n  using: 'node20'\n  main: 'index.js'\n";
+
+        #[tokio::test]
+        async fn fetch_success_parses_action_yml() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
+
+            let resolved = result.unwrap();
+            match resolved.action_type {
+                ActionType::Node { version } => assert_eq!(version, 20),
+                other => panic!("Expected Node action, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn fetch_404_without_token_returns_error() {
+            let _lock = ENV_MUTEX.lock().unwrap();
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            // Ensure GITHUB_TOKEN is not set
+            std::env::remove_var("GITHUB_TOKEN");
+
+            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
+
+            assert!(result.is_err());
+            assert!(
+                result.as_ref().unwrap_err().contains("404"),
+                "Expected 404 in error, got: {}",
+                result.unwrap_err()
+            );
+        }
+
+        /// Verifies the security-critical property: when the auth request gets a
+        /// redirect response (e.g., to a CDN), the redirect is followed WITHOUT
+        /// the Authorization header, preventing the GITHUB_TOKEN from leaking
+        /// to a non-GitHub host.
+        #[tokio::test]
+        async fn auth_redirect_does_not_leak_token() {
+            let _lock = ENV_MUTEX.lock().unwrap();
+            let server = MockServer::start().await;
+
+            // 1. Unauthenticated request → 404 (triggers auth retry).
+            //    Mounted first so it has lowest priority in wiremock's LIFO matching.
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(404))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+
+            // 2. Authenticated retry → 302 redirect to a different path.
+            let redirect_url = format!("{}/cdn/redirected/action.yml", server.uri());
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .and(header_exists("Authorization"))
+                .respond_with(
+                    ResponseTemplate::new(302).insert_header("Location", redirect_url.as_str()),
+                )
+                .mount(&server)
+                .await;
+
+            // 3. Redirect target → 200 with action.yml body.
+            Mock::given(method("GET"))
+                .and(path("/cdn/redirected/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            std::env::set_var("GITHUB_TOKEN", "ghp_test_token_for_redirect_test");
+
+            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
+
+            std::env::remove_var("GITHUB_TOKEN");
+
+            // The resolution should succeed via the redirect path
+            let resolved = result.unwrap();
+            assert!(matches!(
+                resolved.action_type,
+                ActionType::Node { version: 20 }
+            ));
+
+            // Verify the redirect request did NOT include the Authorization header.
+            // This is the core security invariant: tokens must not leak to redirect targets.
+            let requests = server.received_requests().await.unwrap();
+            let redirect_req = requests
+                .iter()
+                .find(|r| r.url.path() == "/cdn/redirected/action.yml")
+                .expect("Expected a request to the redirect target");
+            let has_auth = redirect_req
+                .headers
+                .iter()
+                .any(|(name, _)| name.as_str() == "authorization");
+            assert!(
+                !has_auth,
+                "GITHUB_TOKEN leaked to redirect target! Authorization header found on redirect request."
+            );
+        }
+
+        #[tokio::test]
+        async fn auth_retry_on_404_with_token_succeeds() {
+            let _lock = ENV_MUTEX.lock().unwrap();
+            let server = MockServer::start().await;
+
+            // 1. Unauthenticated → 404
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .respond_with(ResponseTemplate::new(404))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+
+            // 2. Authenticated → 200 (private repo, no redirect)
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/action.yml"))
+                .and(header_exists("Authorization"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            std::env::set_var("GITHUB_TOKEN", "ghp_test_token_for_auth_test");
+
+            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
+
+            std::env::remove_var("GITHUB_TOKEN");
+
+            let resolved = result.unwrap();
+            assert!(matches!(
+                resolved.action_type,
+                ActionType::Node { version: 20 }
+            ));
         }
     }
 }
