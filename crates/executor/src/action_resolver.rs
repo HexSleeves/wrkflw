@@ -54,7 +54,7 @@ impl BoundedCache {
     #[allow(clippy::map_entry)]
     fn insert(&mut self, key: String, value: ResolvedAction) {
         if self.map.contains_key(&key) {
-            // Already cached — update value, don't change LRU order
+            // Already cached — update value, don't change insertion order
             self.map.insert(key, value);
             return;
         }
@@ -121,8 +121,6 @@ async fn fetch_and_parse(
     );
 
     // Try unauthenticated first; only send GITHUB_TOKEN on 404 (private repos).
-    // Safe to send token on retry: the URL always targets raw.githubusercontent.com,
-    // constructed from the repo/version above — never a user-controlled host.
     let response = HTTP_CLIENT
         .get(&url)
         .send()
@@ -130,9 +128,15 @@ async fn fetch_and_parse(
         .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
 
     let response = if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Retry with auth if token is available — the repo may be private
+        // Retry with auth if token is available — the repo may be private.
+        // Use a no-redirect client to prevent leaking the token to a non-GitHub host.
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            HTTP_CLIENT
+            let no_redirect_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+            no_redirect_client
                 .get(&url)
                 .header("Authorization", format!("token {}", token))
                 .send()

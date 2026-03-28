@@ -1740,102 +1740,80 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         .await
                         .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
 
-                    // Check if this was called from 'run' branch - don't try to hide these outputs
-                    if output.exit_code == 0 {
-                        // For GitHub actions in verbose mode, provide more detailed emulation information
-                        let output_text = if ctx.verbose
-                            && uses.contains('/')
-                            && !uses.starts_with("./")
-                        {
-                            let mut detailed_output =
-                                format!("Would execute GitHub action: {}\n", uses);
+                    // Build verbose output for GitHub actions when applicable
+                    let output_text = if ctx.verbose
+                        && output.exit_code == 0
+                        && uses.contains('/')
+                        && !uses.starts_with("./")
+                    {
+                        let mut detailed_output =
+                            format!("Would execute GitHub action: {}\n", uses);
 
-                            // Add information about the action inputs if available
-                            if let Some(with_params) = &ctx.step.with {
-                                detailed_output.push_str("\nAction inputs:\n");
-                                for (key, value) in with_params {
-                                    detailed_output.push_str(&format!("  {}: {}\n", key, value));
-                                }
+                        // Add information about the action inputs if available
+                        if let Some(with_params) = &ctx.step.with {
+                            detailed_output.push_str("\nAction inputs:\n");
+                            for (key, value) in with_params {
+                                detailed_output.push_str(&format!("  {}: {}\n", key, value));
                             }
-
-                            // Add standard GitHub action environment variables
-                            detailed_output.push_str("\nEnvironment variables:\n");
-                            for (key, value) in step_env.iter() {
-                                if key.starts_with("GITHUB_") || key.starts_with("INPUT_") {
-                                    detailed_output.push_str(&format!("  {}: {}\n", key, value));
-                                }
-                            }
-
-                            // Include the original output
-                            detailed_output.push_str(&format!(
-                                "\nOutput:\n{}\n{}",
-                                output.stdout, output.stderr
-                            ));
-                            detailed_output
-                        } else {
-                            format!("{}\n{}", output.stdout, output.stderr)
-                        };
-
-                        // Check if this is a cargo command that failed
-                        if output.exit_code != 0
-                            && (uses.contains("cargo") || uses.contains("rust"))
-                        {
-                            // Add detailed error information for cargo commands
-                            let mut error_details = format!(
-                                "\n\n❌ Command failed with exit code: {}\n",
-                                output.exit_code
-                            );
-
-                            // Add command details
-                            error_details.push_str(&format!("Command: {}\n", cmd.join(" ")));
-
-                            // Add environment details
-                            error_details.push_str("\nEnvironment:\n");
-                            for (key, value) in step_env.iter() {
-                                if key.starts_with("GITHUB_")
-                                    || key.starts_with("INPUT_")
-                                    || key.starts_with("RUST")
-                                {
-                                    error_details.push_str(&format!("  {}: {}\n", key, value));
-                                }
-                            }
-
-                            // Add detailed output
-                            error_details.push_str("\nDetailed output:\n");
-                            error_details.push_str(&output.stdout);
-                            error_details.push_str(&output.stderr);
-
-                            // Return failure with detailed error information
-                            return Ok(StepResult {
-                                name: step_name,
-                                status: StepStatus::Failure,
-                                output: format!("{}\n{}", output_text, error_details),
-                            });
                         }
 
-                        StepResult {
-                            name: step_name,
-                            status: if output.exit_code == 0 {
-                                StepStatus::Success
-                            } else {
-                                StepStatus::Failure
-                            },
-                            output: format!(
-                                "Exit code: {}
-{}
-{}",
-                                output.exit_code, output.stdout, output.stderr
-                            ),
+                        // Add standard GitHub action environment variables
+                        detailed_output.push_str("\nEnvironment variables:\n");
+                        for (key, value) in step_env.iter() {
+                            if key.starts_with("GITHUB_") || key.starts_with("INPUT_") {
+                                detailed_output.push_str(&format!("  {}: {}\n", key, value));
+                            }
                         }
+
+                        // Include the original output
+                        detailed_output
+                            .push_str(&format!("\nOutput:\n{}\n{}", output.stdout, output.stderr));
+                        detailed_output
                     } else {
-                        StepResult {
+                        format!("{}\n{}", output.stdout, output.stderr)
+                    };
+
+                    // Add detailed error information for failed cargo/rust commands
+                    if output.exit_code != 0 && (uses.contains("cargo") || uses.contains("rust")) {
+                        let mut error_details = format!(
+                            "\n\n❌ Command failed with exit code: {}\n",
+                            output.exit_code
+                        );
+
+                        error_details.push_str(&format!("Command: {}\n", cmd.join(" ")));
+
+                        error_details.push_str("\nEnvironment:\n");
+                        for (key, value) in step_env.iter() {
+                            if key.starts_with("GITHUB_")
+                                || key.starts_with("INPUT_")
+                                || key.starts_with("RUST")
+                            {
+                                error_details.push_str(&format!("  {}: {}\n", key, value));
+                            }
+                        }
+
+                        error_details.push_str("\nDetailed output:\n");
+                        error_details.push_str(&output.stdout);
+                        error_details.push_str(&output.stderr);
+
+                        return Ok(StepResult {
                             name: step_name,
                             status: StepStatus::Failure,
-                            output: format!(
-                                "Exit code: {}\n{}\n{}",
-                                output.exit_code, output.stdout, output.stderr
-                            ),
-                        }
+                            output: format!("{}\n{}", output_text, error_details),
+                        });
+                    }
+
+                    StepResult {
+                        name: step_name,
+                        status: if output.exit_code == 0 {
+                            StepStatus::Success
+                        } else {
+                            StepStatus::Failure
+                        },
+                        output: format!(
+                            "Exit code: {}\n{}\n{}",
+                            output.exit_code, output.stdout, output.stderr
+                        ),
                     }
                 }
             }
