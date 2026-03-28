@@ -119,8 +119,15 @@ impl WorkflowDefinition {
         // Parse GitHub action reference like "actions/checkout@v3"
         let parts: Vec<&str> = action_ref.split('@').collect();
 
+        let is_docker = parts[0].starts_with("docker://");
+        let is_local = parts[0].starts_with("./");
+
+        // Docker references (docker://image:tag) embed the tag in the repository
+        // string itself, not via @version, so version is empty for them.
         let (repo, version) = if parts.len() > 1 {
             (parts[0], parts[1])
+        } else if is_docker || is_local {
+            (parts[0], "")
         } else {
             (parts[0], "main") // Default to main if no version specified
         };
@@ -128,8 +135,8 @@ impl WorkflowDefinition {
         ActionInfo {
             repository: repo.to_string(),
             version: version.to_string(),
-            is_docker: repo.starts_with("docker://"),
-            is_local: repo.starts_with("./"),
+            is_docker,
+            is_local,
         }
     }
 }
@@ -237,7 +244,7 @@ mod tests {
         };
         let info = wd.resolve_action("docker://alpine:3.18");
         assert_eq!(info.repository, "docker://alpine:3.18");
-        assert_eq!(info.version, "main");
+        assert_eq!(info.version, "");
         assert!(info.is_docker);
         assert!(!info.is_local);
     }
@@ -252,7 +259,7 @@ mod tests {
         };
         let info = wd.resolve_action("./my-action");
         assert_eq!(info.repository, "./my-action");
-        assert_eq!(info.version, "main");
+        assert_eq!(info.version, "");
         assert!(!info.is_docker);
         assert!(info.is_local);
     }

@@ -28,12 +28,14 @@ pub struct ResolvedAction {
     pub definition: Option<serde_yaml::Value>,
 }
 
-/// Bounded LRU-style cache for successfully resolved actions keyed by "owner/repo@version".
+/// Bounded FIFO cache for successfully resolved actions keyed by "owner/repo@version".
 /// Only successful resolutions are cached — transient failures are not persisted
 /// so that retries can succeed if network conditions improve.
+/// Eviction is insertion-order (FIFO), not access-order, which is sufficient here
+/// because actions are typically resolved once per workflow run.
 struct BoundedCache {
     map: HashMap<String, ResolvedAction>,
-    /// Insertion order for LRU eviction (oldest at front).
+    /// Insertion order for FIFO eviction (oldest at front).
     order: VecDeque<String>,
 }
 
@@ -118,7 +120,9 @@ async fn fetch_and_parse(
         repo, version, filename
     );
 
-    // Try unauthenticated first; only send GITHUB_TOKEN on 404 (private repos)
+    // Try unauthenticated first; only send GITHUB_TOKEN on 404 (private repos).
+    // Safe to send token on retry: the URL always targets raw.githubusercontent.com,
+    // constructed from the repo/version above — never a user-controlled host.
     let response = HTTP_CLIENT
         .get(&url)
         .send()
