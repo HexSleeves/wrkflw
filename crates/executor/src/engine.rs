@@ -642,9 +642,7 @@ async fn shallow_clone(
     git_ref: &str,
     target_dir: &Path,
 ) -> Result<(), ExecutionError> {
-    // NOTE: This only detects SHA-1 (40 hex chars). Git's SHA-256 transition uses
-    // 64-char hashes — update this check if/when GitHub adopts SHA-256 refs.
-    let is_sha = git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit());
+    let is_sha = is_git_sha(git_ref);
 
     if is_sha {
         // SHA refs can't use --branch; use init + fetch + checkout instead
@@ -739,6 +737,14 @@ async fn shallow_clone(
     }
 
     Ok(())
+}
+
+/// Returns `true` if `git_ref` looks like a full SHA-1 hex hash (40 hex chars).
+///
+/// NOTE: This only detects SHA-1 (40 hex chars). Git's SHA-256 transition uses
+/// 64-char hashes — update this check if/when GitHub adopts SHA-256 refs.
+fn is_git_sha(git_ref: &str) -> bool {
+    git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Determine the appropriate Docker image for a GitHub action
@@ -1386,8 +1392,6 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     }
                 }
                 PreparedAction::Image(image) => {
-                    // Regular Docker or JavaScript action processing
-                    // ... (rest of the existing code for handling regular actions)
                     // Build command for Docker action
                     let mut cmd = Vec::new();
                     let mut owned_strings: Vec<String> = Vec::new(); // Keep strings alive until after we use cmd
@@ -2753,4 +2757,49 @@ fn evaluate_job_condition(
         condition
     ));
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_git_sha_recognizes_valid_sha1() {
+        assert!(is_git_sha("a81bbbf8298c0fa03ea29cdc473d45769f953675"));
+    }
+
+    #[test]
+    fn is_git_sha_recognizes_uppercase_hex() {
+        assert!(is_git_sha("A81BBBF8298C0FA03EA29CDC473D45769F953675"));
+    }
+
+    #[test]
+    fn is_git_sha_rejects_short_hash() {
+        assert!(!is_git_sha("a81bbbf"));
+    }
+
+    #[test]
+    fn is_git_sha_rejects_branch_name() {
+        assert!(!is_git_sha("main"));
+    }
+
+    #[test]
+    fn is_git_sha_rejects_tag() {
+        assert!(!is_git_sha("v4"));
+    }
+
+    #[test]
+    fn is_git_sha_rejects_empty() {
+        assert!(!is_git_sha(""));
+    }
+
+    #[test]
+    fn is_git_sha_rejects_non_hex_40_chars() {
+        assert!(!is_git_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+    }
+
+    #[test]
+    fn is_git_sha_rejects_41_chars() {
+        assert!(!is_git_sha("a81bbbf8298c0fa03ea29cdc473d45769f9536750"));
+    }
 }

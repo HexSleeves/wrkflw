@@ -99,7 +99,12 @@ pub async fn resolve_remote_action(repo: &str, version: &str) -> Result<Resolved
     // Try action.yml first, then action.yaml
     let result = match fetch_and_parse(repo, version, "action.yml").await {
         Ok(resolved) => Ok(resolved),
-        Err(_) => fetch_and_parse(repo, version, "action.yaml").await,
+        Err(yml_err) => fetch_and_parse(repo, version, "action.yaml").await.map_err(|yaml_err| {
+            format!(
+                "Neither action.yml ({}) nor action.yaml ({}) could be resolved",
+                yml_err, yaml_err
+            )
+        }),
     };
 
     // Only cache successful resolutions — transient failures should be retryable
