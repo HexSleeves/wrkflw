@@ -5,7 +5,7 @@ use regex;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
 
@@ -966,6 +966,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
 
     // Add container-level environment variables (lowest precedence)
     if let Some(ref container) = job.container {
+        warn_unsupported_container_fields(container);
         for (key, value) in &container.env {
             job_env.entry(key.clone()).or_insert_with(|| value.clone());
         }
@@ -1172,6 +1173,7 @@ async fn execute_matrix_job(
 
     // Add container-level environment variables (lowest precedence)
     if let Some(ref container) = job_template.container {
+        warn_unsupported_container_fields(container);
         for (key, value) in &container.env {
             job_env.entry(key.clone()).or_insert_with(|| value.clone());
         }
@@ -1751,48 +1753,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                     let mut volumes: Vec<(&Path, &Path)> =
                         vec![(ctx.working_dir, container_workspace)];
 
-                    // Mount GitHub environment files directory and remap paths for container runtimes
-                    let container_github_dir = Path::new("/github/workflow");
-                    let is_container_runtime = step_env
-                        .get("WRKFLW_RUNTIME_MODE")
-                        .map(|m| m == "docker" || m == "podman")
-                        .unwrap_or(false);
-                    if let Some(github_env_path) = ctx.job_env.get("GITHUB_ENV") {
-                        if let Some(github_dir) = Path::new(github_env_path).parent() {
-                            if is_container_runtime {
-                                volumes.push((github_dir, container_github_dir));
-                                step_env.insert("GITHUB_ENV".into(), "/github/workflow/env".into());
-                                step_env.insert(
-                                    "GITHUB_OUTPUT".into(),
-                                    "/github/workflow/output".into(),
-                                );
-                                step_env
-                                    .insert("GITHUB_PATH".into(), "/github/workflow/path".into());
-                                step_env.insert(
-                                    "GITHUB_STEP_SUMMARY".into(),
-                                    "/github/workflow/step_summary".into(),
-                                );
-                            } else if let Some(github_parent) = github_dir.parent() {
-                                volumes.push((github_parent, github_parent));
-                            }
-                        }
-                    }
-
-                    // Add container-defined volumes
-                    let mut owned_volume_paths: Vec<(std::path::PathBuf, std::path::PathBuf)> =
-                        Vec::new();
-                    if let Some(container_volumes) =
-                        ctx.container_config.and_then(|c| c.volumes.as_ref())
-                    {
-                        for vol_spec in container_volumes {
-                            let parts: Vec<&str> = vol_spec.splitn(2, ':').collect();
-                            if parts.len() == 2 {
-                                owned_volume_paths.push((
-                                    std::path::PathBuf::from(parts[0]),
-                                    std::path::PathBuf::from(parts[1]),
-                                ));
-                            }
-                        }
+                    // Prepare container mounts and remap GitHub env paths
+                    let (owned_volume_paths, github_mount) =
+                        prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
+                    if let Some((ref host, ref container)) = github_mount {
+                        volumes.push((host.as_path(), container.as_path()));
                     }
                     for (host, container) in &owned_volume_paths {
                         volumes.push((host.as_path(), container.as_path()));
@@ -1930,41 +1895,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         // Set up volume mapping from host working dir to container workspace
         let mut volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace)];
 
-        // Mount GitHub environment files directory and remap paths for container runtimes
-        let container_github_dir = Path::new("/github/workflow");
-        let is_container_runtime = step_env
-            .get("WRKFLW_RUNTIME_MODE")
-            .map(|m| m == "docker" || m == "podman")
-            .unwrap_or(false);
-        if let Some(github_env_path) = ctx.job_env.get("GITHUB_ENV") {
-            if let Some(github_dir) = Path::new(github_env_path).parent() {
-                if is_container_runtime {
-                    volumes.push((github_dir, container_github_dir));
-                    step_env.insert("GITHUB_ENV".into(), "/github/workflow/env".into());
-                    step_env.insert("GITHUB_OUTPUT".into(), "/github/workflow/output".into());
-                    step_env.insert("GITHUB_PATH".into(), "/github/workflow/path".into());
-                    step_env.insert(
-                        "GITHUB_STEP_SUMMARY".into(),
-                        "/github/workflow/step_summary".into(),
-                    );
-                } else if let Some(github_parent) = github_dir.parent() {
-                    volumes.push((github_parent, github_parent));
-                }
-            }
-        }
-
-        // Add container-defined volumes
-        let mut owned_volume_paths: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-        if let Some(container_volumes) = ctx.container_config.and_then(|c| c.volumes.as_ref()) {
-            for vol_spec in container_volumes {
-                let parts: Vec<&str> = vol_spec.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    owned_volume_paths.push((
-                        std::path::PathBuf::from(parts[0]),
-                        std::path::PathBuf::from(parts[1]),
-                    ));
-                }
-            }
+        // Prepare container mounts and remap GitHub env paths
+        let (owned_volume_paths, github_mount) =
+            prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
+        if let Some((ref host, ref container)) = github_mount {
+            volumes.push((host.as_path(), container.as_path()));
         }
         for (host, container) in &owned_volume_paths {
             volumes.push((host.as_path(), container.as_path()));
@@ -2283,6 +2218,85 @@ fn get_effective_runner_image(job: &Job) -> String {
         container.image.clone()
     } else {
         get_runner_image_from_opt(&job.runs_on)
+    }
+}
+
+type VolumePathPair = (PathBuf, PathBuf);
+
+/// Prepare container volume mounts and remap GitHub environment file paths for container runtimes.
+///
+/// Returns owned volume path pairs that should be appended to the volumes list,
+/// and mutates `step_env` to remap GITHUB_ENV/GITHUB_OUTPUT/GITHUB_PATH/GITHUB_STEP_SUMMARY
+/// to container-internal paths when running under Docker/Podman.
+fn prepare_container_mounts(
+    step_env: &mut HashMap<String, String>,
+    job_env: &HashMap<String, String>,
+    container_config: Option<&JobContainer>,
+) -> (Vec<VolumePathPair>, Option<VolumePathPair>) {
+    let container_github_dir = Path::new("/github/workflow");
+    let is_container_runtime = step_env
+        .get("WRKFLW_RUNTIME_MODE")
+        .map(|m| m == "docker" || m == "podman")
+        .unwrap_or(false);
+
+    // Mount GitHub environment files directory and remap paths
+    let github_mount = if let Some(github_env_path) = job_env.get("GITHUB_ENV") {
+        if let Some(github_dir) = Path::new(github_env_path).parent() {
+            if is_container_runtime {
+                step_env.insert("GITHUB_ENV".into(), "/github/workflow/env".into());
+                step_env.insert("GITHUB_OUTPUT".into(), "/github/workflow/output".into());
+                step_env.insert("GITHUB_PATH".into(), "/github/workflow/path".into());
+                step_env.insert(
+                    "GITHUB_STEP_SUMMARY".into(),
+                    "/github/workflow/step_summary".into(),
+                );
+                Some((github_dir.to_path_buf(), container_github_dir.to_path_buf()))
+            } else {
+                github_dir
+                    .parent()
+                    .map(|p| (p.to_path_buf(), p.to_path_buf()))
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Collect container-defined volumes
+    let mut owned_volume_paths: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Some(container_volumes) = container_config.and_then(|c| c.volumes.as_ref()) {
+        for vol_spec in container_volumes {
+            let parts: Vec<&str> = vol_spec.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                owned_volume_paths.push((PathBuf::from(parts[0]), PathBuf::from(parts[1])));
+            } else {
+                // Single path: mount at same location inside container
+                let p = PathBuf::from(parts[0]);
+                owned_volume_paths.push((p.clone(), p));
+            }
+        }
+    }
+
+    (owned_volume_paths, github_mount)
+}
+
+/// Log warnings for container fields that are parsed but not yet supported.
+fn warn_unsupported_container_fields(container: &JobContainer) {
+    if container.options.is_some() {
+        wrkflw_logging::warning(
+            "container 'options' field is not yet supported and will be ignored",
+        );
+    }
+    if container.credentials.is_some() {
+        wrkflw_logging::warning(
+            "container 'credentials' field is not yet supported and will be ignored",
+        );
+    }
+    if container.ports.is_some() {
+        wrkflw_logging::warning(
+            "container 'ports' field is not yet supported (service containers are not implemented)",
+        );
     }
 }
 

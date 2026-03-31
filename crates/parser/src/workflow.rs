@@ -446,4 +446,124 @@ jobs:
             parsed.err()
         );
     }
+
+    #[test]
+    fn parse_container_string_format() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: container-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: node:18
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        let container = job.container.as_ref().expect("container should be Some");
+        assert_eq!(container.image, "node:18");
+        assert!(container.env.is_empty());
+        assert!(container.credentials.is_none());
+        assert!(container.ports.is_none());
+        assert!(container.volumes.is_none());
+        assert!(container.options.is_none());
+    }
+
+    #[test]
+    fn parse_container_object_format() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: container-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: node:18-alpine
+      credentials:
+        username: user
+        password: pass
+      env:
+        NODE_ENV: production
+      ports:
+        - "8080:80"
+      volumes:
+        - /host/path:/container/path
+        - /single-path
+      options: "--cpus 2"
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        let container = job.container.as_ref().expect("container should be Some");
+        assert_eq!(container.image, "node:18-alpine");
+        assert_eq!(container.env.get("NODE_ENV").unwrap(), "production");
+        let creds = container.credentials.as_ref().unwrap();
+        assert_eq!(creds.username.as_deref(), Some("user"));
+        assert_eq!(creds.password.as_deref(), Some("pass"));
+        assert_eq!(
+            container.ports.as_ref().unwrap(),
+            &vec!["8080:80".to_string()]
+        );
+        let volumes = container.volumes.as_ref().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0], "/host/path:/container/path");
+        assert_eq!(volumes[1], "/single-path");
+        assert_eq!(container.options.as_deref(), Some("--cpus 2"));
+    }
+
+    #[test]
+    fn parse_container_absent() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: no-container
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        assert!(job.container.is_none());
+    }
+
+    #[test]
+    fn parse_container_image_with_colon_in_tag() {
+        let temp_dir = tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("workflow.yml");
+
+        let content = r#"
+name: container-test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: ghcr.io/owner/image:latest
+    steps:
+      - run: echo hi
+"#;
+        fs::write(&workflow_path, content).unwrap();
+
+        let parsed = parse_workflow(&workflow_path).unwrap();
+        let job = parsed.jobs.get("test").unwrap();
+        let container = job.container.as_ref().unwrap();
+        assert_eq!(container.image, "ghcr.io/owner/image:latest");
+    }
 }
