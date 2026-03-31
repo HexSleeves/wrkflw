@@ -117,25 +117,71 @@ pub struct Step {
 impl WorkflowDefinition {
     pub fn resolve_action(&self, action_ref: &str) -> ActionInfo {
         // Parse GitHub action reference like "actions/checkout@v3"
-        let parts: Vec<&str> = action_ref.split('@').collect();
+        let is_docker = action_ref.starts_with("docker://");
+        let is_local = action_ref.starts_with("./");
 
-        let (repo, _) = if parts.len() > 1 {
-            (parts[0], parts[1])
+        // Docker references can contain `@sha256:digest` (e.g., `docker://alpine@sha256:abc`).
+        // Don't split on `@` for Docker refs — the full string is the image reference.
+        // Local paths also never have a meaningful `@version`.
+        if is_docker {
+            return ActionInfo {
+                repository: action_ref.to_string(),
+                version: String::new(),
+                sub_path: None,
+                is_docker: true,
+                is_local: false,
+            };
+        }
+        if is_local {
+            return ActionInfo {
+                repository: action_ref.to_string(),
+                version: String::new(),
+                sub_path: None,
+                is_docker: false,
+                is_local: true,
+            };
+        }
+
+        // For GitHub action references, split on the first `@` to get repo and version.
+        let (full_repo, version) = if let Some(at_pos) = action_ref.find('@') {
+            (&action_ref[..at_pos], &action_ref[at_pos + 1..])
         } else {
-            (parts[0], "main") // Default to main if no version specified
+            (action_ref, "main") // Default to main if no version specified
+        };
+
+        // GitHub action refs can include a sub-path: `owner/repo/path/to/action@ref`.
+        // Split into the repo (`owner/repo`) and optional sub-path (`path/to/action`).
+        let parts: Vec<&str> = full_repo.splitn(3, '/').collect();
+        let (repo, sub_path) = if parts.len() == 3 {
+            (
+                format!("{}/{}", parts[0], parts[1]),
+                Some(parts[2].to_string()),
+            )
+        } else {
+            (full_repo.to_string(), None)
         };
 
         ActionInfo {
-            repository: repo.to_string(),
-            is_docker: repo.starts_with("docker://"),
-            is_local: repo.starts_with("./"),
+            repository: repo,
+            version: version.to_string(),
+            sub_path,
+            is_docker: false,
+            is_local: false,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ActionInfo {
+    /// The repository identifier (`owner/repo`), Docker image ref, or local path.
     pub repository: String,
+    /// The git ref (tag, branch, or SHA) for GitHub action references.
+    /// Empty for Docker refs (`docker://...`) and local paths (`./...`).
+    /// Defaults to `"main"` when a GitHub action ref omits `@version`.
+    pub version: String,
+    /// Optional sub-path within the repository for actions like `owner/repo/path@ref`.
+    /// `None` for simple `owner/repo@ref`, Docker refs, and local paths.
+    pub sub_path: Option<String>,
     pub is_docker: bool,
     pub is_local: bool,
 }
@@ -193,9 +239,129 @@ fn normalize_triggers(on_value: &serde_yaml::Value) -> Result<Vec<String>, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::parse_workflow;
+    use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolve_action_parses_version() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("actions/checkout@v4");
+        assert_eq!(info.repository, "actions/checkout");
+        assert_eq!(info.version, "v4");
+        assert!(info.sub_path.is_none());
+        assert!(!info.is_docker);
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_defaults_version_to_main() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("owner/repo");
+        assert_eq!(info.repository, "owner/repo");
+        assert_eq!(info.version, "main");
+        assert!(info.sub_path.is_none());
+    }
+
+    #[test]
+    fn resolve_action_docker_reference() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("docker://alpine:3.18");
+        assert_eq!(info.repository, "docker://alpine:3.18");
+        assert_eq!(info.version, "");
+        assert!(info.is_docker);
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_local_path() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("./my-action");
+        assert_eq!(info.repository, "./my-action");
+        assert_eq!(info.version, "");
+        assert!(!info.is_docker);
+        assert!(info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_docker_with_digest() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        // Docker image references can use @sha256:digest — the full string is the image ref
+        let info = wd.resolve_action("docker://alpine@sha256:abcdef1234567890");
+        assert_eq!(info.repository, "docker://alpine@sha256:abcdef1234567890");
+        assert_eq!(info.version, "");
+        assert!(info.is_docker);
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_with_sha_version() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675");
+        assert_eq!(info.repository, "actions/checkout");
+        assert_eq!(info.version, "a81bbbf8298c0fa03ea29cdc473d45769f953675");
+        assert!(info.sub_path.is_none());
+    }
+
+    #[test]
+    fn resolve_action_with_sub_path() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("owner/repo/path/to/action@v2");
+        assert_eq!(info.repository, "owner/repo");
+        assert_eq!(info.version, "v2");
+        assert_eq!(info.sub_path.as_deref(), Some("path/to/action"));
+        assert!(!info.is_docker);
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_with_single_sub_path() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("github/codeql-action/init@v3");
+        assert_eq!(info.repository, "github/codeql-action");
+        assert_eq!(info.version, "v3");
+        assert_eq!(info.sub_path.as_deref(), Some("init"));
+    }
 
     #[test]
     fn parse_workflow_allows_null_workflow_dispatch_with_other_triggers() {
