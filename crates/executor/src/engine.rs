@@ -2279,6 +2279,11 @@ fn prepare_container_mounts(
     let mut owned_volume_paths: Vec<VolumePathPair> = Vec::new();
     if let Some(container_volumes) = container_config.and_then(|c| c.volumes.as_ref()) {
         for vol_spec in container_volumes {
+            if vol_spec.is_empty() {
+                wrkflw_logging::warning("skipping empty volume spec");
+                continue;
+            }
+            // NOTE: splitn(3, ':') won't correctly handle Windows-style host paths (e.g. C:\data:/container)
             let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
             match parts.len() {
                 3 => {
@@ -3046,7 +3051,7 @@ mod tests {
         let (_volumes, github_mount) = prepare_container_mounts(&mut step_env, &job_env, None);
 
         // Env vars should NOT be remapped
-        assert!(step_env.get("GITHUB_ENV").is_none());
+        assert!(!step_env.contains_key("GITHUB_ENV"));
 
         // Should mount the parent directory identity-mapped
         let (host, container) = github_mount.unwrap();
@@ -3166,9 +3171,9 @@ mod tests {
         // GITHUB_ENV should be remapped
         assert_eq!(step_env.get("GITHUB_ENV").unwrap(), "/github/workflow/env");
         // Others should NOT be inserted (no phantom paths)
-        assert!(step_env.get("GITHUB_OUTPUT").is_none());
-        assert!(step_env.get("GITHUB_PATH").is_none());
-        assert!(step_env.get("GITHUB_STEP_SUMMARY").is_none());
+        assert!(!step_env.contains_key("GITHUB_OUTPUT"));
+        assert!(!step_env.contains_key("GITHUB_PATH"));
+        assert!(!step_env.contains_key("GITHUB_STEP_SUMMARY"));
     }
 
     // --- container env precedence tests ---
