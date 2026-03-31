@@ -585,7 +585,13 @@ async fn prepare_action(
 
     // GitHub action: try to fetch action.yml from the remote repository
     if !action.repository.is_empty() && !action.version.is_empty() {
-        match action_resolver::resolve_remote_action(&action.repository, &action.version).await {
+        match action_resolver::resolve_remote_action(
+            &action.repository,
+            &action.version,
+            action.sub_path.as_deref(),
+        )
+        .await
+        {
             Ok(resolved) => match &resolved.action_type {
                 action_resolver::ActionType::Node { version } => {
                     let image = format!("node:{}-slim", version);
@@ -1378,10 +1384,15 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         let repo_url = format!("https://github.com/{}.git", action_info.repository);
                         let repo_dir = tempdir.path().join("action");
                         shallow_clone(&repo_url, &action_info.version, &repo_dir).await?;
+                        // If the action has a sub-path, the action.yml is inside that directory
+                        let action_dir = match &action_info.sub_path {
+                            Some(p) => repo_dir.join(p),
+                            None => repo_dir,
+                        };
                         // tempdir must stay alive until execute_composite_action completes
                         execute_composite_action(
                             ctx.step,
-                            &repo_dir,
+                            &action_dir,
                             &step_env,
                             ctx.working_dir,
                             ctx.runtime,

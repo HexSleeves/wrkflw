@@ -97,10 +97,21 @@ const GITHUB_RAW_BASE_URL: &str = "https://raw.githubusercontent.com";
 
 /// Fetch and parse `action.yml` (or `action.yaml`) from a remote GitHub repository.
 ///
+/// `sub_path` is the optional path within the repo (e.g., for `owner/repo/path@ref`,
+/// `sub_path` is `Some("path")`). When present, the action metadata is fetched from
+/// `{repo}/{version}/{sub_path}/action.yml` instead of `{repo}/{version}/action.yml`.
+///
 /// Returns `Ok(ResolvedAction)` on success, or `Err` if the action metadata cannot be
 /// fetched or parsed. Callers should fall back to hardcoded image mappings on error.
-pub async fn resolve_remote_action(repo: &str, version: &str) -> Result<ResolvedAction, String> {
-    let cache_key = format!("{}@{}", repo, version);
+pub async fn resolve_remote_action(
+    repo: &str,
+    version: &str,
+    sub_path: Option<&str>,
+) -> Result<ResolvedAction, String> {
+    let cache_key = match sub_path {
+        Some(p) => format!("{}/{}@{}", repo, p, version),
+        None => format!("{}@{}", repo, version),
+    };
 
     // Check cache first (read lock — allows concurrent reads)
     {
@@ -110,17 +121,35 @@ pub async fn resolve_remote_action(repo: &str, version: &str) -> Result<Resolved
         }
     }
 
+    let token = std::env::var("GITHUB_TOKEN").ok();
+
     // Try action.yml first, then action.yaml
-    let result = match fetch_and_parse(GITHUB_RAW_BASE_URL, repo, version, "action.yml").await {
+    let result = match fetch_and_parse(
+        GITHUB_RAW_BASE_URL,
+        repo,
+        version,
+        sub_path,
+        "action.yml",
+        token.as_deref(),
+    )
+    .await
+    {
         Ok(resolved) => Ok(resolved),
-        Err(yml_err) => fetch_and_parse(GITHUB_RAW_BASE_URL, repo, version, "action.yaml")
-            .await
-            .map_err(|yaml_err| {
-                format!(
-                    "Neither action.yml ({}) nor action.yaml ({}) could be resolved",
-                    yml_err, yaml_err
-                )
-            }),
+        Err(yml_err) => fetch_and_parse(
+            GITHUB_RAW_BASE_URL,
+            repo,
+            version,
+            sub_path,
+            "action.yaml",
+            token.as_deref(),
+        )
+        .await
+        .map_err(|yaml_err| {
+            format!(
+                "Neither action.yml ({}) nor action.yaml ({}) could be resolved",
+                yml_err, yaml_err
+            )
+        }),
     };
 
     // Only cache successful resolutions — transient failures should be retryable
@@ -136,9 +165,14 @@ async fn fetch_and_parse(
     base_url: &str,
     repo: &str,
     version: &str,
+    sub_path: Option<&str>,
     filename: &str,
+    token: Option<&str>,
 ) -> Result<ResolvedAction, String> {
-    let url = format!("{}/{}/{}/{}", base_url, repo, version, filename);
+    let url = match sub_path {
+        Some(p) => format!("{}/{}/{}/{}/{}", base_url, repo, version, p, filename),
+        None => format!("{}/{}/{}/{}", base_url, repo, version, filename),
+    };
 
     // Try unauthenticated first; only send GITHUB_TOKEN on 404 (private repos).
     let response = HTTP_CLIENT
@@ -151,7 +185,7 @@ async fn fetch_and_parse(
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             // Retry with auth if token is available — the repo may be private.
             // NO_REDIRECT_CLIENT prevents leaking the token to a non-GitHub host.
-            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            if let Some(token) = token {
                 let auth_response = NO_REDIRECT_CLIENT
                     .get(&url)
                     .header("Authorization", format!("token {}", token))
@@ -516,15 +550,11 @@ runs:
 
     /// Tests for `fetch_and_parse` HTTP behavior using wiremock.
     ///
-    /// All tests that modify `GITHUB_TOKEN` are serialized via `ENV_MUTEX`
-    /// to prevent races between parallel test threads.
+    /// Token is passed as a parameter to `fetch_and_parse`, so no env mutation is needed.
     mod fetch_tests {
         use super::super::*;
-        use std::sync::Mutex;
         use wiremock::matchers::{header_exists, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
         const ACTION_YML_BODY: &str =
             "name: Test Action\nruns:\n  using: 'node20'\n  main: 'index.js'\n";
@@ -539,7 +569,8 @@ runs:
                 .mount(&server)
                 .await;
 
-            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
+            let result =
+                fetch_and_parse(&server.uri(), "owner/repo", "v1", None, "action.yml", None).await;
 
             let resolved = result.unwrap();
             match resolved.action_type {
@@ -549,8 +580,34 @@ runs:
         }
 
         #[tokio::test]
+        async fn fetch_with_sub_path() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/owner/repo/v1/my/action/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ACTION_YML_BODY))
+                .mount(&server)
+                .await;
+
+            let result = fetch_and_parse(
+                &server.uri(),
+                "owner/repo",
+                "v1",
+                Some("my/action"),
+                "action.yml",
+                None,
+            )
+            .await;
+
+            let resolved = result.unwrap();
+            assert!(matches!(
+                resolved.action_type,
+                ActionType::Node { version: 20 }
+            ));
+        }
+
+        #[tokio::test]
         async fn fetch_404_without_token_returns_error() {
-            let _lock = ENV_MUTEX.lock().unwrap();
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -559,16 +616,8 @@ runs:
                 .mount(&server)
                 .await;
 
-            // Save and remove GITHUB_TOKEN so the auth retry path is not taken
-            let saved_token = std::env::var("GITHUB_TOKEN").ok();
-            std::env::remove_var("GITHUB_TOKEN");
-
-            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
-
-            // Restore original value
-            if let Some(val) = saved_token {
-                std::env::set_var("GITHUB_TOKEN", val);
-            }
+            let result =
+                fetch_and_parse(&server.uri(), "owner/repo", "v1", None, "action.yml", None).await;
 
             assert!(result.is_err());
             assert!(
@@ -584,7 +633,6 @@ runs:
         /// to a non-GitHub host.
         #[tokio::test]
         async fn auth_redirect_does_not_leak_token() {
-            let _lock = ENV_MUTEX.lock().unwrap();
             let server = MockServer::start().await;
 
             // 1. Unauthenticated request → 404 (triggers auth retry).
@@ -614,16 +662,15 @@ runs:
                 .mount(&server)
                 .await;
 
-            let saved_token = std::env::var("GITHUB_TOKEN").ok();
-            std::env::set_var("GITHUB_TOKEN", "ghp_test_token_for_redirect_test");
-
-            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
-
-            // Restore original value
-            match saved_token {
-                Some(val) => std::env::set_var("GITHUB_TOKEN", val),
-                None => std::env::remove_var("GITHUB_TOKEN"),
-            }
+            let result = fetch_and_parse(
+                &server.uri(),
+                "owner/repo",
+                "v1",
+                None,
+                "action.yml",
+                Some("ghp_test_token_for_redirect_test"),
+            )
+            .await;
 
             // The resolution should succeed via the redirect path
             let resolved = result.unwrap();
@@ -651,7 +698,6 @@ runs:
 
         #[tokio::test]
         async fn auth_retry_on_404_with_token_succeeds() {
-            let _lock = ENV_MUTEX.lock().unwrap();
             let server = MockServer::start().await;
 
             // 1. Unauthenticated → 404
@@ -670,16 +716,15 @@ runs:
                 .mount(&server)
                 .await;
 
-            let saved_token = std::env::var("GITHUB_TOKEN").ok();
-            std::env::set_var("GITHUB_TOKEN", "ghp_test_token_for_auth_test");
-
-            let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
-
-            // Restore original value
-            match saved_token {
-                Some(val) => std::env::set_var("GITHUB_TOKEN", val),
-                None => std::env::remove_var("GITHUB_TOKEN"),
-            }
+            let result = fetch_and_parse(
+                &server.uri(),
+                "owner/repo",
+                "v1",
+                None,
+                "action.yml",
+                Some("ghp_test_token_for_auth_test"),
+            )
+            .await;
 
             let resolved = result.unwrap();
             assert!(matches!(

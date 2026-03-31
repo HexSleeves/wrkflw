@@ -127,6 +127,7 @@ impl WorkflowDefinition {
             return ActionInfo {
                 repository: action_ref.to_string(),
                 version: String::new(),
+                sub_path: None,
                 is_docker: true,
                 is_local: false,
             };
@@ -135,21 +136,35 @@ impl WorkflowDefinition {
             return ActionInfo {
                 repository: action_ref.to_string(),
                 version: String::new(),
+                sub_path: None,
                 is_docker: false,
                 is_local: true,
             };
         }
 
         // For GitHub action references, split on the first `@` to get repo and version.
-        let (repo, version) = if let Some(at_pos) = action_ref.find('@') {
+        let (full_repo, version) = if let Some(at_pos) = action_ref.find('@') {
             (&action_ref[..at_pos], &action_ref[at_pos + 1..])
         } else {
             (action_ref, "main") // Default to main if no version specified
         };
 
+        // GitHub action refs can include a sub-path: `owner/repo/path/to/action@ref`.
+        // Split into the repo (`owner/repo`) and optional sub-path (`path/to/action`).
+        let parts: Vec<&str> = full_repo.splitn(3, '/').collect();
+        let (repo, sub_path) = if parts.len() == 3 {
+            (
+                format!("{}/{}", parts[0], parts[1]),
+                Some(parts[2].to_string()),
+            )
+        } else {
+            (full_repo.to_string(), None)
+        };
+
         ActionInfo {
-            repository: repo.to_string(),
+            repository: repo,
             version: version.to_string(),
+            sub_path,
             is_docker: false,
             is_local: false,
         }
@@ -158,11 +173,15 @@ impl WorkflowDefinition {
 
 #[derive(Debug, Clone)]
 pub struct ActionInfo {
+    /// The repository identifier (`owner/repo`), Docker image ref, or local path.
     pub repository: String,
     /// The git ref (tag, branch, or SHA) for GitHub action references.
     /// Empty for Docker refs (`docker://...`) and local paths (`./...`).
     /// Defaults to `"main"` when a GitHub action ref omits `@version`.
     pub version: String,
+    /// Optional sub-path within the repository for actions like `owner/repo/path@ref`.
+    /// `None` for simple `owner/repo@ref`, Docker refs, and local paths.
+    pub sub_path: Option<String>,
     pub is_docker: bool,
     pub is_local: bool,
 }
@@ -235,6 +254,7 @@ mod tests {
         let info = wd.resolve_action("actions/checkout@v4");
         assert_eq!(info.repository, "actions/checkout");
         assert_eq!(info.version, "v4");
+        assert!(info.sub_path.is_none());
         assert!(!info.is_docker);
         assert!(!info.is_local);
     }
@@ -250,6 +270,7 @@ mod tests {
         let info = wd.resolve_action("owner/repo");
         assert_eq!(info.repository, "owner/repo");
         assert_eq!(info.version, "main");
+        assert!(info.sub_path.is_none());
     }
 
     #[test]
@@ -309,6 +330,37 @@ mod tests {
         let info = wd.resolve_action("actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675");
         assert_eq!(info.repository, "actions/checkout");
         assert_eq!(info.version, "a81bbbf8298c0fa03ea29cdc473d45769f953675");
+        assert!(info.sub_path.is_none());
+    }
+
+    #[test]
+    fn resolve_action_with_sub_path() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("owner/repo/path/to/action@v2");
+        assert_eq!(info.repository, "owner/repo");
+        assert_eq!(info.version, "v2");
+        assert_eq!(info.sub_path.as_deref(), Some("path/to/action"));
+        assert!(!info.is_docker);
+        assert!(!info.is_local);
+    }
+
+    #[test]
+    fn resolve_action_with_single_sub_path() {
+        let wd = WorkflowDefinition {
+            name: String::new(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        };
+        let info = wd.resolve_action("github/codeql-action/init@v3");
+        assert_eq!(info.repository, "github/codeql-action");
+        assert_eq!(info.version, "v3");
+        assert_eq!(info.sub_path.as_deref(), Some("init"));
     }
 
     #[test]
