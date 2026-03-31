@@ -159,6 +159,9 @@ impl WorkflowDefinition {
 #[derive(Debug, Clone)]
 pub struct ActionInfo {
     pub repository: String,
+    /// The git ref (tag, branch, or SHA) for GitHub action references.
+    /// Empty for Docker refs (`docker://...`) and local paths (`./...`).
+    /// Defaults to `"main"` when a GitHub action ref omits `@version`.
     pub version: String,
     pub is_docker: bool,
     pub is_local: bool,

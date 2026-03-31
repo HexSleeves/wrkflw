@@ -1699,7 +1699,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             cmd.push("sh");
                             cmd.push("-c");
 
-                            let echo_msg = format!("echo 'Would execute GitHub action: {}'", uses);
+                            let escaped_uses = uses.replace('\'', "'\\''");
+                            let echo_msg =
+                                format!("echo 'Would execute GitHub action: {}'", escaped_uses);
                             owned_strings.push(echo_msg);
                             cmd.push(owned_strings.last().unwrap());
                         }

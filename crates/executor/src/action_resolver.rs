@@ -559,10 +559,16 @@ runs:
                 .mount(&server)
                 .await;
 
-            // Ensure GITHUB_TOKEN is not set
+            // Save and remove GITHUB_TOKEN so the auth retry path is not taken
+            let saved_token = std::env::var("GITHUB_TOKEN").ok();
             std::env::remove_var("GITHUB_TOKEN");
 
             let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
+
+            // Restore original value
+            if let Some(val) = saved_token {
+                std::env::set_var("GITHUB_TOKEN", val);
+            }
 
             assert!(result.is_err());
             assert!(
@@ -608,11 +614,16 @@ runs:
                 .mount(&server)
                 .await;
 
+            let saved_token = std::env::var("GITHUB_TOKEN").ok();
             std::env::set_var("GITHUB_TOKEN", "ghp_test_token_for_redirect_test");
 
             let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
 
-            std::env::remove_var("GITHUB_TOKEN");
+            // Restore original value
+            match saved_token {
+                Some(val) => std::env::set_var("GITHUB_TOKEN", val),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
 
             // The resolution should succeed via the redirect path
             let resolved = result.unwrap();
@@ -659,11 +670,16 @@ runs:
                 .mount(&server)
                 .await;
 
+            let saved_token = std::env::var("GITHUB_TOKEN").ok();
             std::env::set_var("GITHUB_TOKEN", "ghp_test_token_for_auth_test");
 
             let result = fetch_and_parse(&server.uri(), "owner/repo", "v1", "action.yml").await;
 
-            std::env::remove_var("GITHUB_TOKEN");
+            // Restore original value
+            match saved_token {
+                Some(val) => std::env::set_var("GITHUB_TOKEN", val),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
 
             let resolved = result.unwrap();
             assert!(matches!(
