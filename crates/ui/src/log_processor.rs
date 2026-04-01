@@ -202,7 +202,7 @@ impl LogProcessor {
         // Extract timestamp from log format [HH:MM:SS]
         let timestamp = if log_line.starts_with('[') && log_line.contains(']') {
             let end = log_line.find(']').unwrap_or(0);
-            if end > 1 {
+            if end > 1 && log_line.is_char_boundary(1) && log_line.is_char_boundary(end) {
                 log_line[1..end].to_string()
             } else {
                 "??:??:??".to_string()
@@ -240,7 +240,11 @@ impl LogProcessor {
         // Extract content after timestamp
         let content = if log_line.starts_with('[') && log_line.contains(']') {
             let start = log_line.find(']').unwrap_or(0) + 1;
-            log_line[start..].trim()
+            if log_line.is_char_boundary(start) {
+                log_line[start..].trim()
+            } else {
+                log_line
+            }
         } else {
             log_line
         };

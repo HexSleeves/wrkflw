@@ -271,23 +271,6 @@ impl ContainerRuntime for EmulationRuntime {
                         exit_code
                     ));
 
-                    if exit_code != 0 {
-                        let mut error_details = format!(
-                            "Command failed with exit code: {}\nCommand: {}\n\nError output:\n{}",
-                            exit_code, command_str, error
-                        );
-
-                        // Add environment variables to error details
-                        error_details.push_str("\n\nEnvironment variables:\n");
-                        for (key, value) in env_vars {
-                            if key.starts_with("GITHUB_") || key.starts_with("CI_") {
-                                error_details.push_str(&format!("{}={}\n", key, value));
-                            }
-                        }
-
-                        return Err(ContainerError::ContainerExecution(error_details));
-                    }
-
                     return Ok(ContainerOutput {
                         stdout: output,
                         stderr: error,
@@ -354,27 +337,6 @@ impl ContainerRuntime for EmulationRuntime {
 
                     wrkflw_logging::debug(&format!("Command exit code: {}", exit_code));
 
-                    if exit_code != 0 {
-                        let mut error_details = format!(
-                            "Command failed with exit code: {}\nCommand: {}\n\nError output:\n{}",
-                            exit_code, command_str, error
-                        );
-
-                        // Add environment variables to error details
-                        error_details.push_str("\n\nEnvironment variables:\n");
-                        for (key, value) in env_vars {
-                            if key.starts_with("GITHUB_")
-                                || key.starts_with("RUST")
-                                || key.starts_with("CARGO")
-                                || key.starts_with("CI_")
-                            {
-                                error_details.push_str(&format!("{}={}\n", key, value));
-                            }
-                        }
-
-                        return Err(ContainerError::ContainerExecution(error_details));
-                    }
-
                     return Ok(ContainerOutput {
                         stdout: output,
                         stderr: error,
@@ -409,28 +371,8 @@ impl ContainerRuntime for EmulationRuntime {
 
                 wrkflw_logging::debug(&format!("Command completed with exit code: {}", exit_code));
 
-                if exit_code != 0 {
-                    let mut error_details = format!(
-                        "Command failed with exit code: {}\nCommand: {}\n\nError output:\n{}",
-                        exit_code, command_str, error
-                    );
-
-                    // Add environment variables to error details
-                    error_details.push_str("\n\nEnvironment variables:\n");
-                    for (key, value) in env_vars {
-                        if key.starts_with("GITHUB_") || key.starts_with("CI_") {
-                            error_details.push_str(&format!("{}={}\n", key, value));
-                        }
-                    }
-
-                    return Err(ContainerError::ContainerExecution(error_details));
-                }
-
                 Ok(ContainerOutput {
-                    stdout: format!(
-                        "Emulated container execution with command: {}\n\nOutput:\n{}",
-                        command_str, output
-                    ),
+                    stdout: output,
                     stderr: error,
                     exit_code,
                 })

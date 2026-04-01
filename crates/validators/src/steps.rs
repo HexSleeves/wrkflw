@@ -8,12 +8,12 @@ pub fn validate_steps(steps: &[Value], job_name: &str, result: &mut ValidationRe
 
     for (i, step) in steps.iter().enumerate() {
         if let Some(step_map) = step.as_mapping() {
-            if !step_map.contains_key(Value::String("name".to_string()))
-                && !step_map.contains_key(Value::String("uses".to_string()))
+            // A step must have either 'uses' or 'run' (name alone is not sufficient)
+            if !step_map.contains_key(Value::String("uses".to_string()))
                 && !step_map.contains_key(Value::String("run".to_string()))
             {
                 result.add_issue(format!(
-                    "Job '{}', step {}: Missing 'name', 'uses', or 'run' field",
+                    "Job '{}', step {}: Missing required 'uses' or 'run' field",
                     job_name,
                     i + 1
                 ));
