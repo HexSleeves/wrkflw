@@ -72,6 +72,7 @@ pub async fn execute_workflow_cli(
     path: &Path,
     runtime_type: RuntimeType,
     verbose: bool,
+    show_action_messages: bool,
 ) -> io::Result<()> {
     if !path.exists() {
         return Err(io::Error::new(
@@ -142,6 +143,7 @@ pub async fn execute_workflow_cli(
         verbose,
         preserve_containers_on_failure: false, // Default for this path
         secrets_config: None,                  // Use default secrets configuration
+        show_action_messages,
     };
 
     match wrkflw_executor::execute_workflow(path, config).await {
@@ -462,6 +464,7 @@ pub fn start_next_workflow_execution(
 
         let validation_mode = app.validation_mode;
         let preserve_containers_on_failure = app.preserve_containers_on_failure;
+        let show_action_messages = app.show_action_messages;
 
         // Update workflow status and add execution details
         app.workflows[next_idx].status = WorkflowStatus::Running;
@@ -535,6 +538,7 @@ pub fn start_next_workflow_execution(
                         verbose,
                         preserve_containers_on_failure,
                         secrets_config: None, // Use default secrets configuration
+                        show_action_messages,
                     };
 
                     let execution_result = wrkflw_utils::fd::with_stderr_to_null(|| {

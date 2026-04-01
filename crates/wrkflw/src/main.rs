@@ -405,7 +405,7 @@ async fn main() {
         Some(Commands::Run {
             path,
             runtime,
-            show_action_messages: _,
+            show_action_messages,
             preserve_containers_on_failure,
             gitlab,
         }) => {
@@ -415,6 +415,7 @@ async fn main() {
                 verbose,
                 preserve_containers_on_failure: *preserve_containers_on_failure,
                 secrets_config: None, // Use default secrets configuration
+                show_action_messages: *show_action_messages,
             };
 
             // Check if we're explicitly or implicitly running a GitLab pipeline
@@ -463,60 +464,57 @@ async fn main() {
                 println!("✅ Workflow execution completed successfully!");
 
                 // Print a summary of executed jobs
-                if true {
-                    // Always show job summary
-                    println!("\nJob summary:");
-                    for job in result.jobs {
-                        println!(
-                            "  {} {} ({})",
-                            match job.status {
-                                wrkflw_executor::JobStatus::Success => "✅",
-                                wrkflw_executor::JobStatus::Failure => "❌",
-                                wrkflw_executor::JobStatus::Skipped => "⏭️",
-                            },
-                            job.name,
-                            match job.status {
-                                wrkflw_executor::JobStatus::Success => "success",
-                                wrkflw_executor::JobStatus::Failure => "failure",
-                                wrkflw_executor::JobStatus::Skipped => "skipped",
-                            }
-                        );
+                println!("\nJob summary:");
+                for job in result.jobs {
+                    println!(
+                        "  {} {} ({})",
+                        match job.status {
+                            wrkflw_executor::JobStatus::Success => "✅",
+                            wrkflw_executor::JobStatus::Failure => "❌",
+                            wrkflw_executor::JobStatus::Skipped => "⏭️",
+                        },
+                        job.name,
+                        match job.status {
+                            wrkflw_executor::JobStatus::Success => "success",
+                            wrkflw_executor::JobStatus::Failure => "failure",
+                            wrkflw_executor::JobStatus::Skipped => "skipped",
+                        }
+                    );
 
-                        // Always show steps, not just in debug mode
-                        println!("  Steps:");
-                        for step in job.steps {
-                            let step_status = match step.status {
-                                wrkflw_executor::StepStatus::Success => "✅",
-                                wrkflw_executor::StepStatus::Failure => "❌",
-                                wrkflw_executor::StepStatus::Skipped => "⏭️",
-                            };
+                    // Always show steps, not just in debug mode
+                    println!("  Steps:");
+                    for step in job.steps {
+                        let step_status = match step.status {
+                            wrkflw_executor::StepStatus::Success => "✅",
+                            wrkflw_executor::StepStatus::Failure => "❌",
+                            wrkflw_executor::StepStatus::Skipped => "⏭️",
+                        };
 
-                            println!("    {} {}", step_status, step.name);
+                        println!("    {} {}", step_status, step.name);
 
-                            // If step failed and we're not in verbose mode, show condensed error info
-                            if step.status == wrkflw_executor::StepStatus::Failure && !verbose {
-                                // Extract error information from step output
-                                let error_lines = step
-                                    .output
-                                    .lines()
-                                    .filter(|line| {
-                                        line.contains("error:")
-                                            || line.contains("Error:")
-                                            || line.trim().starts_with("Exit code:")
-                                            || line.contains("failed")
-                                    })
-                                    .take(3) // Limit to 3 most relevant error lines
-                                    .collect::<Vec<&str>>();
+                        // If step failed and we're not in verbose mode, show condensed error info
+                        if step.status == wrkflw_executor::StepStatus::Failure && !verbose {
+                            // Extract error information from step output
+                            let error_lines = step
+                                .output
+                                .lines()
+                                .filter(|line| {
+                                    line.contains("error:")
+                                        || line.contains("Error:")
+                                        || line.trim().starts_with("Exit code:")
+                                        || line.contains("failed")
+                                })
+                                .take(3) // Limit to 3 most relevant error lines
+                                .collect::<Vec<&str>>();
 
-                                if !error_lines.is_empty() {
-                                    println!("      Error details:");
-                                    for line in error_lines {
-                                        println!("      {}", line.trim());
-                                    }
+                            if !error_lines.is_empty() {
+                                println!("      Error details:");
+                                for line in error_lines {
+                                    println!("      {}", line.trim());
+                                }
 
-                                    if step.output.lines().count() > 3 {
-                                        println!("      (Use --verbose for full output)");
-                                    }
+                                if step.output.lines().count() > 3 {
+                                    println!("      (Use --verbose for full output)");
                                 }
                             }
                         }
@@ -541,7 +539,7 @@ async fn main() {
         Some(Commands::Tui {
             path,
             runtime,
-            show_action_messages: _,
+            show_action_messages,
             preserve_containers_on_failure,
         }) => {
             // Set runtime type based on the runtime choice
@@ -553,6 +551,7 @@ async fn main() {
                 runtime_type,
                 verbose,
                 *preserve_containers_on_failure,
+                *show_action_messages,
             )
             .await
             {
@@ -586,7 +585,9 @@ async fn main() {
             let runtime_type = wrkflw_executor::RuntimeType::Docker;
 
             // Call the TUI implementation from the ui crate with default path
-            if let Err(e) = wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false).await {
+            if let Err(e) =
+                wrkflw_ui::run_wrkflw_tui(None, runtime_type, verbose, false, false).await
+            {
                 eprintln!("Error running TUI: {}", e);
                 std::process::exit(1);
             }
@@ -599,21 +600,25 @@ async fn main() {
 fn validate_github_workflow(path: &Path, verbose: bool) -> bool {
     print!("Validating GitHub workflow file: {}... ", path.display());
 
-    // Use the ui crate's validate_workflow function
-    match wrkflw_ui::validate_workflow(path, verbose) {
-        Ok(_) => {
-            // The detailed validation output is already printed by the function
-            // We need to check if there were validation issues
-            // Since wrkflw_ui::validate_workflow doesn't return the validation result directly,
-            // we need to call the evaluator directly to get the result
-            match wrkflw_evaluator::evaluate_workflow_file(path, verbose) {
-                Ok(result) => !result.is_valid,
-                Err(_) => true, // Parse errors count as validation failure
+    match wrkflw_evaluator::evaluate_workflow_file(path, verbose) {
+        Ok(result) => {
+            if result.is_valid {
+                println!("✅ Valid");
+                if verbose {
+                    println!("  All validation checks passed");
+                }
+            } else {
+                println!("❌ Invalid");
+                for (i, issue) in result.issues.iter().enumerate() {
+                    println!("   {}. {}", i + 1, issue);
+                }
             }
+            !result.is_valid
         }
         Err(e) => {
-            eprintln!("Error validating workflow: {}", e);
-            true // Any error counts as validation failure
+            println!("❌ Error");
+            eprintln!("  {}", e);
+            true // Parse errors count as validation failure
         }
     }
 }
@@ -659,28 +664,33 @@ fn list_workflows_and_pipelines(verbose: bool) {
     if github_path.exists() && github_path.is_dir() {
         println!("GitHub Workflows:");
 
-        let entries = match std::fs::read_dir(&github_path) {
-            Ok(rd) => rd,
-            Err(e) => {
-                eprintln!("Failed to read directory {}: {}", github_path.display(), e);
-                return;
-            }
-        }
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry.path().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
-        })
-        .collect::<Vec<_>>();
+        match std::fs::read_dir(&github_path) {
+            Ok(rd) => {
+                let entries: Vec<_> = rd
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry.path().is_file()
+                            && entry
+                                .path()
+                                .extension()
+                                .is_some_and(|ext| ext == "yml" || ext == "yaml")
+                    })
+                    .collect();
 
-        if entries.is_empty() {
-            println!("  No workflow files found in .github/workflows");
-        } else {
-            for entry in entries {
-                println!("  - {}", entry.path().display());
+                if entries.is_empty() {
+                    println!("  No workflow files found in .github/workflows");
+                } else {
+                    for entry in entries {
+                        println!("  - {}", entry.path().display());
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "  Failed to read directory {}: {}",
+                    github_path.display(),
+                    e
+                );
             }
         }
     } else {

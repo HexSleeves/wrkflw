@@ -1,7 +1,6 @@
 #[allow(unused_imports)]
 use bollard::Docker;
 use futures::future;
-use regex;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -21,7 +20,7 @@ use wrkflw_matrix::MatrixCombination;
 use wrkflw_models::gitlab::Pipeline;
 use wrkflw_parser::gitlab::{self, parse_pipeline};
 use wrkflw_parser::workflow::{
-    self, parse_workflow, ActionInfo, Job, JobContainer, WorkflowDefinition,
+    self, parse_workflow, ActionInfo, Job, JobContainer, Step, WorkflowDefinition,
 };
 use wrkflw_runtime::container::ContainerRuntime;
 use wrkflw_runtime::emulation;
@@ -110,10 +109,15 @@ async fn execute_github_workflow(
         },
     );
 
-    // Add flag to hide GitHub action messages when in emulation mode
+    // show=true means hide=false (inverted for the env var)
     env_context.insert(
         "WRKFLW_HIDE_ACTION_MESSAGES".to_string(),
-        "true".to_string(),
+        if config.show_action_messages {
+            "false"
+        } else {
+            "true"
+        }
+        .to_string(),
     );
 
     // Setup GitHub environment files
@@ -472,6 +476,7 @@ pub struct ExecutionConfig {
     pub verbose: bool,
     pub preserve_containers_on_failure: bool,
     pub secrets_config: Option<SecretConfig>,
+    pub show_action_messages: bool,
 }
 
 pub struct ExecutionResult {
@@ -891,7 +896,7 @@ async fn execute_job_with_matrix(
     }
 
     // Check if this is a matrix job
-    if let Some(matrix_config) = &job.matrix {
+    if let Some(matrix_config) = job.matrix_config() {
         // Expand the matrix into combinations
         let combinations = wrkflw_matrix::expand_matrix(matrix_config)
             .map_err(|e| ExecutionError::Execution(format!("Failed to expand matrix: {}", e)))?;
@@ -912,7 +917,7 @@ async fn execute_job_with_matrix(
         ));
 
         // Set maximum parallel jobs
-        let max_parallel = matrix_config.max_parallel.unwrap_or_else(|| {
+        let max_parallel = job.max_parallel().unwrap_or_else(|| {
             // If not specified, use a reasonable default based on CPU cores
             std::cmp::max(1, num_cpus::get())
         });
@@ -923,7 +928,7 @@ async fn execute_job_with_matrix(
             job_template: job,
             combinations: &combinations,
             max_parallel,
-            fail_fast: matrix_config.fail_fast.unwrap_or(true),
+            fail_fast: job.fail_fast(),
             workflow,
             runtime,
             env_context,
@@ -999,29 +1004,33 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
     let runner_image_value = get_effective_runner_image(job);
 
     for (idx, step) in job.steps.iter().enumerate() {
-        let step_result = execute_step(StepExecutionContext {
+        let outcome = run_step_with_guards(
             step,
-            step_idx: idx,
-            job_env: &job_env,
-            working_dir: job_dir.path(),
-            runtime: ctx.runtime,
-            workflow: ctx.workflow,
-            runner_image: &runner_image_value,
-            verbose: ctx.verbose,
-            matrix_combination: &None,
-            secret_manager: ctx.secret_manager,
-            secret_masker: ctx.secret_masker,
-            container_config: job.container.as_ref(),
-        })
-        .await;
+            idx,
+            &job_env,
+            ctx.workflow,
+            StepExecutionContext {
+                step,
+                step_idx: idx,
+                job_env: &job_env,
+                working_dir: job_dir.path(),
+                runtime: ctx.runtime,
+                workflow: ctx.workflow,
+                runner_image: &runner_image_value,
+                verbose: ctx.verbose,
+                matrix_combination: &None,
+                secret_manager: ctx.secret_manager,
+                secret_masker: ctx.secret_masker,
+                container_config: job.container.as_ref(),
+            },
+        )
+        .await?;
 
-        match step_result {
-            Ok(result) => {
-                // Check if step was successful
-                if result.status == StepStatus::Failure {
-                    job_success = false;
-                }
-
+        match outcome {
+            StepOutcome::Skipped(result) => {
+                step_results.push(result);
+            }
+            StepOutcome::Completed { result, abort_job } => {
                 // Add step output to logs only in verbose mode or if there's an error
                 if ctx.verbose || result.status == StepStatus::Failure {
                     job_logs.push_str(&format!(
@@ -1029,7 +1038,6 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                         result.name, result.output
                     ));
                 } else {
-                    // In non-verbose mode, just record that the step ran but don't include output
                     job_logs.push_str(&format!(
                         "Step '{}' completed with status: {:?}\n",
                         result.name, result.status
@@ -1037,23 +1045,11 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                 }
 
                 step_results.push(result);
-            }
-            Err(e) => {
-                job_success = false;
-                job_logs.push_str(&format!("\n=== ERROR in step {} ===\n{}\n", idx + 1, e));
 
-                // Record the error as a failed step
-                step_results.push(StepResult {
-                    name: step
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("Step {}", idx + 1)),
-                    status: StepStatus::Failure,
-                    output: format!("Error: {}", e),
-                });
-
-                // Stop executing further steps
-                break;
+                if abort_job {
+                    job_success = false;
+                    break;
+                }
             }
         }
     }
@@ -1206,28 +1202,38 @@ async fn execute_matrix_job(
         // Determine runner image: prefer job container image, fall back to runs-on mapping
         let runner_image_value = get_effective_runner_image(job_template);
 
+        let mut all_steps_ok = true;
         for (idx, step) in job_template.steps.iter().enumerate() {
-            match execute_step(StepExecutionContext {
+            let outcome = run_step_with_guards(
                 step,
-                step_idx: idx,
-                job_env: &job_env,
-                working_dir: job_dir.path(),
-                runtime,
+                idx,
+                &job_env,
                 workflow,
-                runner_image: &runner_image_value,
-                verbose,
-                matrix_combination: &Some(combination.values.clone()),
-                secret_manager: None, // Matrix execution context doesn't have secrets yet
-                secret_masker: None,
-                container_config: job_template.container.as_ref(),
-            })
-            .await
-            {
-                Ok(result) => {
+                StepExecutionContext {
+                    step,
+                    step_idx: idx,
+                    job_env: &job_env,
+                    working_dir: job_dir.path(),
+                    runtime,
+                    workflow,
+                    runner_image: &runner_image_value,
+                    verbose,
+                    matrix_combination: &Some(combination.values.clone()),
+                    secret_manager: None,
+                    secret_masker: None,
+                    container_config: job_template.container.as_ref(),
+                },
+            )
+            .await?;
+
+            match outcome {
+                StepOutcome::Skipped(result) => {
+                    step_results.push(result);
+                }
+                StepOutcome::Completed { result, abort_job } => {
                     job_logs.push_str(&format!("Step: {}\n", result.name));
                     job_logs.push_str(&format!("Status: {:?}\n", result.status));
 
-                    // Only include step output in verbose mode or if there's an error
                     if verbose || result.status == StepStatus::Failure {
                         job_logs.push_str(&result.output);
                         job_logs.push_str("\n\n");
@@ -1236,32 +1242,17 @@ async fn execute_matrix_job(
                         job_logs.push('\n');
                     }
 
-                    step_results.push(result.clone());
+                    step_results.push(result);
 
-                    if result.status != StepStatus::Success {
-                        // Step failed, abort job
-                        return Ok(JobResult {
-                            name: matrix_job_name,
-                            status: JobStatus::Failure,
-                            steps: step_results,
-                            logs: job_logs,
-                        });
+                    if abort_job {
+                        all_steps_ok = false;
+                        break;
                     }
-                }
-                Err(e) => {
-                    // Log the error and abort the job
-                    job_logs.push_str(&format!("Step execution error: {}\n\n", e));
-                    return Ok(JobResult {
-                        name: matrix_job_name,
-                        status: JobStatus::Failure,
-                        steps: step_results,
-                        logs: job_logs,
-                    });
                 }
             }
         }
 
-        true
+        all_steps_ok
     };
 
     // Return job result
@@ -1275,6 +1266,89 @@ async fn execute_matrix_job(
         steps: step_results,
         logs: job_logs,
     })
+}
+
+/// Outcome of a single step after guards (if-condition, continue-on-error) are applied.
+enum StepOutcome {
+    /// Step ran (or was skipped). Contains the result and whether the job should abort.
+    Completed { result: StepResult, abort_job: bool },
+    /// Step was skipped due to an if-condition.
+    Skipped(StepResult),
+}
+
+/// Run a step with if-condition and continue-on-error guards.
+/// Returns the step result and whether the job should be aborted.
+async fn run_step_with_guards(
+    step: &Step,
+    step_idx: usize,
+    job_env: &HashMap<String, String>,
+    workflow: &WorkflowDefinition,
+    step_exec_ctx: StepExecutionContext<'_>,
+) -> Result<StepOutcome, ExecutionError> {
+    let step_name = step
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Step {}", step_idx + 1));
+
+    // Check step-level if condition
+    if let Some(if_cond) = &step.if_condition {
+        let should_run = evaluate_job_condition(if_cond, job_env, workflow);
+        if !should_run {
+            wrkflw_logging::info(&format!(
+                "  ⏭️ Skipping step '{}' due to condition: {}",
+                step_name, if_cond
+            ));
+            return Ok(StepOutcome::Skipped(StepResult {
+                name: step_name,
+                status: StepStatus::Skipped,
+                output: format!("Skipped due to condition: {}", if_cond),
+            }));
+        }
+    }
+
+    match execute_step(step_exec_ctx).await {
+        Ok(result) => {
+            let abort_job = if result.status == StepStatus::Failure {
+                if step.continue_on_error == Some(true) {
+                    wrkflw_logging::info(&format!(
+                        "  Step '{}' failed but continue-on-error is set, continuing",
+                        result.name
+                    ));
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            Ok(StepOutcome::Completed { result, abort_job })
+        }
+        Err(e) => {
+            if step.continue_on_error == Some(true) {
+                wrkflw_logging::info(&format!(
+                    "  Step '{}' errored but continue-on-error is set, continuing",
+                    step_name
+                ));
+                Ok(StepOutcome::Completed {
+                    result: StepResult {
+                        name: step_name,
+                        status: StepStatus::Failure,
+                        output: format!("Error: {}", e),
+                    },
+                    abort_job: false,
+                })
+            } else {
+                Ok(StepOutcome::Completed {
+                    result: StepResult {
+                        name: step_name,
+                        status: StepStatus::Failure,
+                        output: format!("Error: {}", e),
+                    },
+                    abort_job: true,
+                })
+            }
+        }
+    }
 }
 
 // Before the execute_step function, add this struct
@@ -1485,41 +1559,14 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                     // Add any arguments if specified
                                     if let Some(args) = with_params.get("args") {
                                         if !args.is_empty() {
-                                            // Resolve GitHub-style variables in args
-                                            let resolved_args = if args.contains("${{") {
-                                                wrkflw_logging::info(&format!(
-                                                    "🔄 Resolving workflow variables in: {}",
-                                                    args
-                                                ));
-
-                                                // Handle common matrix variables
-                                                let mut resolved =
-                                                    args.replace("${{ matrix.target }}", "");
-                                                resolved = resolved.replace("${{ matrix.os }}", "");
-
-                                                // Handle any remaining ${{ variables }} by removing them
-                                                let re_pattern =
-                                                    regex::Regex::new(r"\$\{\{\s*([^}]+)\s*\}\}")
-                                                        .unwrap_or_else(|_| {
-                                                            wrkflw_logging::error(
-                                                                "Failed to create regex pattern",
-                                                            );
-                                                            regex::Regex::new(r"\$\{\{.*?\}\}")
-                                                                .unwrap()
-                                                        });
-
-                                                let resolved = re_pattern
-                                                    .replace_all(&resolved, "")
-                                                    .to_string();
-                                                wrkflw_logging::info(&format!(
-                                                    "🔄 Resolved to: {}",
-                                                    resolved
-                                                ));
-
-                                                resolved.trim().to_string()
-                                            } else {
-                                                args.clone()
-                                            };
+                                            // Resolve GitHub-style matrix variables in args
+                                            let resolved_args =
+                                                crate::substitution::process_step_run(
+                                                    args,
+                                                    ctx.matrix_combination,
+                                                )
+                                                .trim()
+                                                .to_string();
 
                                             // Only add if we have something left after resolving variables
                                             // and it's not just "--target" without a value
@@ -1668,39 +1715,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                                 // Add any arguments if specified
                                 if let Some(args) = with_params.get("args") {
                                     if !args.is_empty() {
-                                        // Resolve GitHub-style variables in args
-                                        let resolved_args = if args.contains("${{") {
-                                            wrkflw_logging::info(&format!(
-                                                "🔄 Resolving workflow variables in: {}",
-                                                args
-                                            ));
-
-                                            // Handle common matrix variables
-                                            let mut resolved =
-                                                args.replace("${{ matrix.target }}", "");
-                                            resolved = resolved.replace("${{ matrix.os }}", "");
-
-                                            // Handle any remaining ${{ variables }} by removing them
-                                            let re_pattern =
-                                                regex::Regex::new(r"\$\{\{\s*([^}]+)\s*\}\}")
-                                                    .unwrap_or_else(|_| {
-                                                        wrkflw_logging::error(
-                                                            "Failed to create regex pattern",
-                                                        );
-                                                        regex::Regex::new(r"\$\{\{.*?\}\}").unwrap()
-                                                    });
-
-                                            let resolved =
-                                                re_pattern.replace_all(&resolved, "").to_string();
-                                            wrkflw_logging::info(&format!(
-                                                "🔄 Resolved to: {}",
-                                                resolved
-                                            ));
-
-                                            resolved.trim().to_string()
-                                        } else {
-                                            args.clone()
-                                        };
+                                        // Resolve GitHub-style matrix variables in args
+                                        let resolved_args = crate::substitution::process_step_run(
+                                            args,
+                                            ctx.matrix_combination,
+                                        )
+                                        .trim()
+                                        .to_string();
 
                                         // Only add if we have something left after resolving variables
                                         if !resolved_args.is_empty() {
@@ -2057,6 +2078,11 @@ fn copy_directory_contents_with_gitignore(
             entry.map_err(|e| ExecutionError::Execution(format!("Failed to read entry: {}", e)))?;
         let path = entry.path();
 
+        if path.is_symlink() {
+            wrkflw_logging::debug(&format!("Skipping symlink: {:?}", path));
+            continue;
+        }
+
         // Check if the file should be ignored according to .gitignore
         if let Some(gitignore) = gitignore {
             let relative_path = path.strip_prefix(from).unwrap_or(&path);
@@ -2290,6 +2316,18 @@ fn prepare_container_mounts(
             }
             // NOTE: splitn(3, ':') won't correctly handle Windows-style host paths (e.g. C:\data:/container)
             let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
+            // Check host path for path traversal (only the host component, not the full spec)
+            let host_path = parts[0];
+            if std::path::Path::new(host_path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                wrkflw_logging::warning(&format!(
+                    "Skipping volume with path traversal in host path: {}",
+                    vol_spec
+                ));
+                continue;
+            }
             match parts.len() {
                 3 => {
                     if parts[0].is_empty() || parts[1].is_empty() {
@@ -2875,6 +2913,23 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
     // Extract continue_on_error
     let continue_on_error = step_yaml.get("continue-on-error").and_then(|v| v.as_bool());
 
+    let if_condition = step_yaml
+        .get("if")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let id = step_yaml
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let working_directory = step_yaml
+        .get("working-directory")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let timeout_minutes = step_yaml.get("timeout-minutes").and_then(|v| v.as_f64());
+
     Ok(workflow::Step {
         name,
         uses,
@@ -2882,17 +2937,71 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
         with,
         env,
         continue_on_error,
+        if_condition,
+        id,
+        working_directory,
+        shell,
+        timeout_minutes,
     })
 }
 
 /// Evaluate a job condition expression
-/// This is a simplified implementation that handles basic GitHub Actions expressions
+/// This is a simplified implementation that handles basic GitHub Actions expressions.
+/// Note: step-level expressions like `steps.<id>.outcome`, `success()`, `failure()`,
+/// `always()`, and `cancelled()` are not yet fully supported — a warning is emitted
+/// and the condition defaults to its most likely state (`always()`/`success()` → true,
+/// `failure()`/`cancelled()` → false).
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
     workflow: &WorkflowDefinition,
 ) -> bool {
     wrkflw_logging::debug(&format!("Evaluating condition: {}", condition));
+
+    // Handle status functions and step references that we can't fully evaluate.
+    // We default conservatively: only `always()` and `success()` resolve to true,
+    // since those represent the common "run this step" intent. Bare `steps.*`
+    // references (e.g. `steps.X.outcome == 'failure'`) default to false to avoid
+    // running steps that depend on prior failure/output we can't evaluate.
+    let has_always = condition.contains("always()");
+    let has_success = condition.contains("success()");
+    let has_failure = condition.contains("failure()");
+    let has_cancelled = condition.contains("cancelled()");
+    // Match "steps." only at word boundaries to avoid false positives on env var
+    // names like "env.MY_STEPS_COUNT" or "env._STEPS_CHECK". We check for
+    // start-of-string or a character that isn't alphanumeric/underscore before "steps.".
+    let has_steps_ref = condition.match_indices("steps.").any(|(pos, _)| {
+        pos == 0 || {
+            let b = condition.as_bytes()[pos - 1];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        }
+    });
+    let has_unsupported =
+        has_always || has_success || has_failure || has_cancelled || has_steps_ref;
+
+    if has_unsupported {
+        wrkflw_logging::warning(&format!(
+            "Condition '{}' uses status functions/step references not fully supported in local execution",
+            condition
+        ));
+
+        // In GitHub Actions, `always()` means "run this step regardless of job
+        // status" — it is a *scheduling* directive, not a boolean `true` literal.
+        // Similarly, `success()` means "run when all previous steps succeeded".
+        // Since we can't evaluate actual job/step status locally, we treat
+        // `always()` and `success()` as "likely to run" → true, and `failure()`
+        // / `cancelled()` as "unlikely" → false.
+        //
+        // Known limitation: compound expressions like `always() && failure()` will
+        // return true (because `always()` is present) even though a real evaluator
+        // would AND the two. This is acceptable because we lack step-status context
+        // and would rather over-run than silently skip steps.
+        if has_always || has_success {
+            return true;
+        }
+        // Bare steps.* refs, failure(), cancelled() without positive counterpart → false
+        return false;
+    }
 
     // For now, implement basic pattern matching for common conditions
     // TODO: Implement a full GitHub Actions expression evaluator
@@ -2982,7 +3091,7 @@ mod tests {
             container,
             steps: Vec::new(),
             env: HashMap::new(),
-            matrix: None,
+            strategy: None,
             services: HashMap::new(),
             if_condition: None,
             outputs: None,
@@ -3273,5 +3382,146 @@ mod tests {
         assert_eq!(job_env.get("CONTAINER_ONLY").unwrap(), "container-value");
         // Job-only keys are preserved
         assert_eq!(job_env.get("JOB_ONLY").unwrap(), "job-value");
+    }
+
+    // --- evaluate_job_condition tests for step-level expressions ---
+
+    fn empty_workflow() -> workflow::WorkflowDefinition {
+        workflow::WorkflowDefinition {
+            name: "test".to_string(),
+            on: Vec::new(),
+            on_raw: serde_yaml::Value::Null,
+            jobs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn condition_true_false_literals() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("true", &env, &wf));
+        assert!(!evaluate_job_condition("false", &env, &wf));
+    }
+
+    #[test]
+    fn condition_steps_reference_defaults_false() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // Bare step-level expressions default to false (conservative — we can't evaluate them)
+        assert!(!evaluate_job_condition(
+            "steps.build.outcome == 'success'",
+            &env,
+            &wf
+        ));
+    }
+
+    #[test]
+    fn condition_success_function_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("success()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_failure_function_defaults_false() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(!evaluate_job_condition("failure()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_always_function_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(evaluate_job_condition("always()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_cancelled_function_defaults_false() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        assert!(!evaluate_job_condition("cancelled()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_compound_failure_or_success_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // success() is present, so compound expression should default to true
+        assert!(evaluate_job_condition("failure() || success()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_compound_failure_and_cancelled_defaults_false() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // Only negative functions, no positive counterpart → false
+        assert!(!evaluate_job_condition(
+            "failure() || cancelled()",
+            &env,
+            &wf
+        ));
+    }
+
+    #[test]
+    fn condition_always_with_failure_defaults_true() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // always() present → true regardless of other functions
+        assert!(evaluate_job_condition("always() && failure()", &env, &wf));
+    }
+
+    #[test]
+    fn condition_env_var_containing_steps_not_treated_as_step_ref() {
+        let env = HashMap::new();
+        let wf = empty_workflow();
+        // "env.MY_STEPS_COUNT" contains "steps." as a substring but should NOT
+        // trigger the step-reference heuristic (which returns false). Instead it
+        // falls through to the unknown-condition default (true).
+        // A bare "steps.build.outcome" at the start SHOULD be caught.
+        assert!(evaluate_job_condition(
+            "env.MY_STEPS_COUNT == '5'",
+            &env,
+            &wf
+        ));
+        // Underscore-prefixed names should also NOT be treated as step refs
+        assert!(evaluate_job_condition(
+            "env._STEPS_CHECK == 'ok'",
+            &env,
+            &wf
+        ));
+        assert!(!evaluate_job_condition(
+            "steps.build.outcome == 'success'",
+            &env,
+            &wf
+        ));
+    }
+
+    // --- volume path traversal tests ---
+
+    fn has_path_traversal(host_path: &str) -> bool {
+        std::path::Path::new(host_path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    }
+
+    #[test]
+    fn volume_traversal_check_rejects_host_traversal() {
+        assert!(has_path_traversal("../../../etc/passwd"));
+        assert!(has_path_traversal("/safe/../etc/passwd"));
+    }
+
+    #[test]
+    fn volume_traversal_check_allows_dotdot_in_container_path() {
+        // Container path with ".." in it should NOT trigger the host check
+        let vol_spec = "/safe/host:/container/..weird";
+        let parts: Vec<&str> = vol_spec.splitn(3, ':').collect();
+        assert!(!has_path_traversal(parts[0]));
+    }
+
+    #[test]
+    fn volume_traversal_allows_double_dot_prefix_dir() {
+        // A directory literally named "..hidden" is not path traversal
+        assert!(!has_path_traversal("/data/..hidden/files"));
     }
 }

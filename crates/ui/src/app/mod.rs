@@ -27,6 +27,7 @@ pub async fn run_wrkflw_tui(
     runtime_type: RuntimeType,
     verbose: bool,
     preserve_containers_on_failure: bool,
+    show_action_messages: bool,
 ) -> io::Result<()> {
     // Terminal setup
     enable_raw_mode()?;
@@ -46,6 +47,7 @@ pub async fn run_wrkflw_tui(
         runtime_type.clone(),
         tx.clone(),
         preserve_containers_on_failure,
+        show_action_messages,
     );
 
     if app.validation_mode {
@@ -115,8 +117,13 @@ pub async fn run_wrkflw_tui(
             if let Some(path) = path {
                 if path.is_file() {
                     wrkflw_logging::error("Falling back to CLI mode...");
-                    crate::handlers::workflow::execute_workflow_cli(path, runtime_type, verbose)
-                        .await
+                    crate::handlers::workflow::execute_workflow_cli(
+                        path,
+                        runtime_type,
+                        verbose,
+                        show_action_messages,
+                    )
+                    .await
                 } else if path.is_dir() {
                     crate::handlers::workflow::validate_workflow(path, verbose)
                 } else {
