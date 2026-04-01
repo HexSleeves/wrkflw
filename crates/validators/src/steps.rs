@@ -55,3 +55,53 @@ pub fn validate_steps(steps: &[Value], job_name: &str, result: &mut ValidationRe
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wrkflw_models::ValidationResult;
+
+    #[test]
+    fn test_step_with_only_name_is_invalid() {
+        let yaml = r#"
+- name: "just a name"
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", &mut result);
+
+        assert!(!result.is_valid);
+        assert!(result
+            .issues
+            .iter()
+            .any(|i| i.contains("Missing required 'uses' or 'run' field")));
+    }
+
+    #[test]
+    fn test_step_with_run_is_valid() {
+        let yaml = r#"
+- name: "build"
+  run: "cargo build"
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", &mut result);
+
+        assert!(result.is_valid);
+        assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn test_step_with_uses_is_valid() {
+        let yaml = r#"
+- name: "checkout"
+  uses: "actions/checkout@v4"
+"#;
+        let steps: Vec<Value> = serde_yaml::from_str(yaml).unwrap();
+        let mut result = ValidationResult::new();
+        validate_steps(&steps, "test-job", &mut result);
+
+        assert!(result.is_valid);
+        assert!(result.issues.is_empty());
+    }
+}

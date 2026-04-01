@@ -341,19 +341,23 @@ async fn main() {
                     let entries = match std::fs::read_dir(&validate_path) {
                         Ok(rd) => rd,
                         Err(e) => {
-                            eprintln!("Failed to read directory {}: {}", validate_path.display(), e);
+                            eprintln!(
+                                "Failed to read directory {}: {}",
+                                validate_path.display(),
+                                e
+                            );
                             std::process::exit(1);
                         }
                     }
-                        .filter_map(|entry| entry.ok())
-                        .filter(|entry| {
-                            entry.path().is_file()
-                                && entry
-                                    .path()
-                                    .extension()
-                                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
-                        })
-                        .collect::<Vec<_>>();
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry.path().is_file()
+                            && entry
+                                .path()
+                                .extension()
+                                .is_some_and(|ext| ext == "yml" || ext == "yaml")
+                    })
+                    .collect::<Vec<_>>();
 
                     println!(
                         "Validating {} workflow file(s) in {}...",
@@ -660,15 +664,15 @@ fn list_workflows_and_pipelines(verbose: bool) {
                 return;
             }
         }
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.path().is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .is_some_and(|ext| ext == "yml" || ext == "yaml")
-            })
-            .collect::<Vec<_>>();
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.path().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "yml" || ext == "yaml")
+        })
+        .collect::<Vec<_>>();
 
         if entries.is_empty() {
             println!("  No workflow files found in .github/workflows");

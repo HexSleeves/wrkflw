@@ -307,3 +307,24 @@ impl Default for LogProcessor {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multibyte_log_line_does_not_panic() {
+        // Emoji and multi-byte characters near bracket boundaries
+        let entry = LogProcessor::process_log_entry("[🚀] deployed service", "");
+        assert_eq!(entry.log_type, "INFO");
+
+        let entry2 = LogProcessor::process_log_entry("[ñ] latin char", "");
+        assert!(!entry2.timestamp.is_empty());
+    }
+
+    #[test]
+    fn test_normal_timestamp_extraction() {
+        let entry = LogProcessor::process_log_entry("[12:34:56] some log", "");
+        assert_eq!(entry.timestamp, "12:34:56");
+    }
+}

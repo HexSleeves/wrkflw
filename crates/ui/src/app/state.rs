@@ -308,7 +308,6 @@ impl App {
             .filter(|&idx| idx < self.workflows.len());
 
         if let Some(workflow_idx) = current_workflow_idx {
-
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
                 if execution.jobs.is_empty() {
                     return;
@@ -340,10 +339,6 @@ impl App {
             .filter(|&idx| idx < self.workflows.len());
 
         if let Some(workflow_idx) = current_workflow_idx {
-            if workflow_idx >= self.workflows.len() {
-                return;
-            }
-
             if let Some(execution) = &self.workflows[workflow_idx].execution_details {
                 if execution.jobs.is_empty() {
                     return;

@@ -827,3 +827,25 @@ pub fn get_tracked_processes() -> Vec<u32> {
         vec![]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_nonzero_exit_code_returns_ok() {
+        let runtime = EmulationRuntime::new();
+        let result = runtime
+            .run_container(
+                "alpine:latest",
+                &["exit", "42"],
+                &[],
+                Path::new("."),
+                &[(Path::new("."), Path::new("/github/workspace"))],
+            )
+            .await;
+
+        let output = result.expect("non-zero exit should return Ok, not Err");
+        assert_eq!(output.exit_code, 42);
+    }
+}
