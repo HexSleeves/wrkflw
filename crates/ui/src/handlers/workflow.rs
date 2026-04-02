@@ -1,13 +1,16 @@
 // Workflow handlers
-use crate::app::App;
-use crate::models::{ExecutionResultMsg, WorkflowExecution, WorkflowStatus};
-use chrono::Local;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread;
 use wrkflw_evaluator::evaluate_workflow_file;
 use wrkflw_executor::{self, JobStatus, RuntimeType, StepStatus};
+#[cfg(feature = "tui")]
+use {
+    crate::app::App,
+    crate::models::{ExecutionResultMsg, WorkflowExecution, WorkflowStatus},
+    chrono::Local,
+    std::sync::mpsc,
+    std::thread,
+};
 
 // Validate a workflow or directory containing workflows
 pub fn validate_workflow(path: &Path, verbose: bool) -> io::Result<()> {
@@ -382,6 +385,7 @@ pub async fn execute_curl_trigger(
 }
 
 // Extract common workflow execution logic to avoid duplication
+#[cfg(feature = "tui")]
 pub fn start_next_workflow_execution(
     app: &mut App,
     tx_clone: &mpsc::Sender<ExecutionResultMsg>,
