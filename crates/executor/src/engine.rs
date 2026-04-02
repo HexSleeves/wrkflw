@@ -538,7 +538,22 @@ impl From<String> for ExecutionError {
 
 /// The result of preparing an action — either a Docker image to run or a composite action.
 enum PreparedAction {
-    /// A Docker image name to pull and run the action in.
+    /// Docker action: run with the image's native entrypoint/CMD, optionally
+    /// overridden by `runs.entrypoint` and `runs.args` from action.yml.
+    /// Used for DockerBuild and Docker registry actions.
+    NativeDocker {
+        image: String,
+        entrypoint: Option<String>,
+        args: Vec<String>,
+    },
+    /// A Docker image name to run a shell command in.
+    ///
+    /// Used by Node.js actions (resolved to `node:XX-slim`), the
+    /// `determine_action_image` fallback, and `run:` steps. These paths
+    /// build an explicit shell command that is passed as CMD, so the
+    /// image's built-in ENTRYPOINT is intentionally overridden with a
+    /// bash wrapper. If you need the image's native ENTRYPOINT/CMD,
+    /// use `NativeDocker` instead.
     Image(String),
     /// A composite action that needs special step-based execution.
     Composite,
@@ -550,7 +565,7 @@ async fn prepare_action(
     runtime: &dyn ContainerRuntime,
 ) -> Result<PreparedAction, ExecutionError> {
     if action.is_docker {
-        // Docker action: pull the image
+        // Docker action: pull the image and run with its native entrypoint
         let image = action.repository.trim_start_matches("docker://");
 
         runtime
@@ -558,7 +573,11 @@ async fn prepare_action(
             .await
             .map_err(|e| ExecutionError::Runtime(format!("Failed to pull Docker image: {}", e)))?;
 
-        return Ok(PreparedAction::Image(image.to_string()));
+        return Ok(PreparedAction::NativeDocker {
+            image: image.to_string(),
+            entrypoint: None,
+            args: vec![],
+        });
     }
 
     if action.is_local {
@@ -578,11 +597,29 @@ async fn prepare_action(
             let tag = format!("wrkflw-local-action:{}", uuid::Uuid::new_v4());
 
             runtime
-                .build_image(&dockerfile, &tag)
+                .build_image(&dockerfile, &tag, action_dir)
                 .await
                 .map_err(|e| ExecutionError::Runtime(format!("Failed to build image: {}", e)))?;
 
-            return Ok(PreparedAction::Image(tag));
+            // Parse action.yml if present for entrypoint/args
+            let definition: Option<serde_yaml::Value> =
+                std::fs::read_to_string(action_dir.join("action.yml"))
+                    .or_else(|_| std::fs::read_to_string(action_dir.join("action.yaml")))
+                    .ok()
+                    .and_then(|s| serde_yaml::from_str(&s).ok());
+            let (entrypoint, args) =
+                extract_docker_runs_config(definition.as_ref()).map_err(|e| {
+                    ExecutionError::Execution(format!(
+                        "Invalid runs config in local action '{}': {}",
+                        action.repository, e
+                    ))
+                })?;
+
+            return Ok(PreparedAction::NativeDocker {
+                image: tag,
+                entrypoint,
+                args,
+            });
         } else {
             // It's a JavaScript or composite action
             // For simplicity, we'll use node to run it (this would need more work for full support)
@@ -610,10 +647,21 @@ async fn prepare_action(
                 }
                 action_resolver::ActionType::Docker { image } => {
                     wrkflw_logging::info(&format!(
-                        "Resolved action '{}' -> image '{}'",
+                        "Resolved action '{}' -> Docker image '{}'",
                         action.repository, image
                     ));
-                    return Ok(PreparedAction::Image(image.clone()));
+                    let (entrypoint, args) =
+                        extract_docker_runs_config(resolved.definition.as_ref()).map_err(|e| {
+                            ExecutionError::Execution(format!(
+                                "Invalid runs config for action '{}': {}",
+                                action.repository, e
+                            ))
+                        })?;
+                    return Ok(PreparedAction::NativeDocker {
+                        image: image.clone(),
+                        entrypoint,
+                        args,
+                    });
                 }
                 action_resolver::ActionType::Composite => {
                     wrkflw_logging::info(&format!(
@@ -623,11 +671,124 @@ async fn prepare_action(
                     return Ok(PreparedAction::Composite);
                 }
                 action_resolver::ActionType::DockerBuild => {
-                    return Err(ExecutionError::Execution(format!(
-                        "Action '{}' bundles its own Dockerfile (runs.image = Dockerfile). \
-                             Building remote Dockerfiles is not yet supported.",
+                    wrkflw_logging::info(&format!(
+                        "Resolved action '{}' as DockerBuild — cloning and building",
                         action.repository
-                    )));
+                    ));
+
+                    // Clone the repository.
+                    // `tempdir` is only needed through `build_image` — after the
+                    // image is built all files are baked into the Docker image
+                    // and the temp directory can be dropped safely.
+                    let tempdir = tempfile::tempdir().map_err(|e| {
+                        ExecutionError::Execution(format!("Failed to create temp dir: {}", e))
+                    })?;
+                    let repo_url = format!("https://github.com/{}.git", action.repository);
+                    let repo_dir = tempdir.path().join("action");
+                    shallow_clone(&repo_url, &action.version, &repo_dir).await?;
+
+                    // Resolve the action directory (respecting sub_path)
+                    let action_dir = match &action.sub_path {
+                        Some(p) => {
+                            sanitize_sub_path(p).map_err(|e| {
+                                ExecutionError::Execution(format!(
+                                    "Invalid sub_path for action '{}': {}",
+                                    action.repository, e
+                                ))
+                            })?;
+                            repo_dir.join(p)
+                        }
+                        None => repo_dir.clone(),
+                    };
+
+                    // Defense-in-depth: verify the action directory is still
+                    // inside the cloned repo after symlink resolution.
+                    let canon_action_dir = action_dir.canonicalize().map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Failed to canonicalize action directory: {}",
+                            e
+                        ))
+                    })?;
+                    let canon_repo_dir = repo_dir.canonicalize().map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Failed to canonicalize repo directory: {}",
+                            e
+                        ))
+                    })?;
+                    if !canon_action_dir.starts_with(&canon_repo_dir) {
+                        return Err(ExecutionError::Execution(format!(
+                            "Action sub_path escapes repository directory for action '{}'",
+                            action.repository
+                        )));
+                    }
+
+                    // Get the Dockerfile path from action.yml's runs.image field.
+                    let dockerfile_raw = resolved
+                        .definition
+                        .as_ref()
+                        .and_then(|d| d.get("runs"))
+                        .and_then(|r| r.get("image"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("Dockerfile");
+
+                    let dockerfile_rel = sanitize_dockerfile_rel(dockerfile_raw).map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Invalid Dockerfile path for action '{}': {}",
+                            action.repository, e
+                        ))
+                    })?;
+
+                    let dockerfile = action_dir.join(dockerfile_rel);
+
+                    if !dockerfile.exists() {
+                        return Err(ExecutionError::Execution(format!(
+                            "Dockerfile not found at {} for action '{}'",
+                            dockerfile.display(),
+                            action.repository
+                        )));
+                    }
+
+                    // Defense-in-depth: verify the resolved Dockerfile is
+                    // still inside the action directory after symlink resolution.
+                    // (canon_action_dir was already computed above for the sub_path check.)
+                    let canon_dockerfile = dockerfile.canonicalize().map_err(|e| {
+                        ExecutionError::Execution(format!(
+                            "Failed to canonicalize Dockerfile path: {}",
+                            e
+                        ))
+                    })?;
+                    if !canon_dockerfile.starts_with(&canon_action_dir) {
+                        return Err(ExecutionError::Execution(format!(
+                            "Dockerfile path '{}' escapes action directory for action '{}'",
+                            dockerfile.display(),
+                            action.repository
+                        )));
+                    }
+
+                    // Build the image
+                    let tag = format!("wrkflw-action:{}", uuid::Uuid::new_v4());
+                    runtime
+                        .build_image(&dockerfile, &tag, &action_dir)
+                        .await
+                        .map_err(|e| {
+                            ExecutionError::Runtime(format!(
+                                "Failed to build Dockerfile for action '{}': {}",
+                                action.repository, e
+                            ))
+                        })?;
+
+                    let (entrypoint, args) =
+                        extract_docker_runs_config(resolved.definition.as_ref()).map_err(|e| {
+                            ExecutionError::Execution(format!(
+                                "Invalid runs config for action '{}': {}",
+                                action.repository, e
+                            ))
+                        })?;
+                    return Ok(PreparedAction::NativeDocker {
+                        image: tag,
+                        entrypoint,
+                        args,
+                    });
                 }
             },
             Err(e) => {
@@ -644,6 +805,181 @@ async fn prepare_action(
     Ok(PreparedAction::Image(image))
 }
 
+/// Execute a `NativeDocker` action step.
+///
+/// Handles `with.args` / `with.entrypoint` overrides, INPUT_* env injection,
+/// volume setup, and container invocation.
+async fn execute_native_docker_step(
+    ctx: &StepExecutionContext<'_>,
+    step_env: &mut HashMap<String, String>,
+    step_name: String,
+    uses: &str,
+    image: String,
+    entrypoint: Option<String>,
+    args: Vec<String>,
+) -> Result<StepResult, ExecutionError> {
+    // Convert 'with' parameters to INPUT_* environment variables.
+    // Also extract 'with.args' — if provided by the workflow step, it
+    // overrides the action.yml's runs.args as the container CMD
+    // (this matches GitHub Actions behavior).
+    let mut with_args_override: Option<String> = None;
+    // Allow workflow step to override entrypoint via `with.entrypoint`,
+    // matching GitHub Actions behavior.
+    let mut entrypoint = entrypoint;
+    if let Some(with_params) = &ctx.step.with {
+        for (key, value) in with_params {
+            step_env.insert(format!("INPUT_{}", key.to_uppercase()), value.clone());
+        }
+        // Presence of the key is the override signal — even an empty
+        // string means "pass zero args", matching GitHub Actions behavior.
+        if let Some(a) = with_params.get("args") {
+            with_args_override = Some(a.clone());
+        }
+        if let Some(ep) = with_params.get("entrypoint") {
+            entrypoint = Some(ep.clone());
+        }
+    }
+
+    let container_workspace = Path::new("/github/workspace");
+    let mount_ctx = prepare_step_container_context(step_env, ctx.job_env, ctx.container_config);
+    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
+    let env_vars: Vec<(&str, &str)> = step_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    wrkflw_logging::info(&format!(
+        "Running Docker action '{}' with image '{}'",
+        uses, image
+    ));
+
+    // Determine container CMD: workflow `with.args` overrides action.yml `runs.args`.
+    // If neither is specified, the image's built-in CMD takes effect.
+    let effective_args: Vec<String> = if let Some(ref wa) = with_args_override {
+        shlex::split(wa).ok_or_else(|| {
+            ExecutionError::Execution(format!(
+                "Failed to parse 'with.args' for action '{}': \
+                 unmatched quote in {:?}",
+                uses, wa
+            ))
+        })?
+    } else {
+        args
+    };
+    let args_refs: Vec<&str> = effective_args.iter().map(|s| s.as_str()).collect();
+
+    let output = ctx
+        .runtime
+        .run_container(
+            &image,
+            &args_refs,
+            &env_vars,
+            container_workspace,
+            &volumes,
+            entrypoint.as_deref(),
+        )
+        .await
+        .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
+
+    Ok(StepResult {
+        name: step_name,
+        status: if output.exit_code == 0 {
+            StepStatus::Success
+        } else {
+            StepStatus::Failure
+        },
+        output: format!(
+            "Exit code: {}\n{}\n{}",
+            output.exit_code, output.stdout, output.stderr
+        ),
+    })
+}
+
+/// Sanitize a sub-path component from an action reference (e.g. `owner/repo/sub/path`).
+///
+/// Rejects any path component that is exactly `..` to prevent directory
+/// traversal out of the cloned repository. Both `/` and `\` are treated
+/// as separators for defense-in-depth (backslash paths are unlikely in
+/// practice but could bypass a `/`-only check on Windows hosts).
+fn sanitize_sub_path(raw: &str) -> Result<(), String> {
+    if raw.contains('\0') {
+        return Err("null byte not allowed in sub_path".to_string());
+    }
+    // Split on both forward and back slashes to catch Windows-style traversal.
+    if raw.split(&['/', '\\'][..]).any(|c| c == "..") {
+        return Err(format!("path traversal not allowed in sub_path: {}", raw));
+    }
+    Ok(())
+}
+
+/// Sanitize a Dockerfile path from an action.yml `runs.image` field.
+///
+/// Strips the `docker://` prefix and leading slashes, then rejects any
+/// path component that is exactly `..` to prevent directory traversal.
+fn sanitize_dockerfile_rel(raw: &str) -> Result<String, String> {
+    if raw.contains('\0') {
+        return Err("null byte not allowed in Dockerfile path".to_string());
+    }
+    let trimmed = raw
+        .trim_start_matches("docker://")
+        .trim_start_matches('/')
+        .trim_start_matches("./");
+    if trimmed.is_empty() {
+        return Err("empty Dockerfile path".to_string());
+    }
+    if trimmed.split(&['/', '\\'][..]).any(|c| c == "..") {
+        return Err(format!("path traversal not allowed: {}", trimmed));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Extract `runs.entrypoint` and `runs.args` from a parsed action.yml definition.
+///
+/// These fields allow Docker actions to override the image's default ENTRYPOINT
+/// and provide arguments that are passed as CMD.
+///
+/// Returns an error if `runs.args` is a string with unmatched quotes, keeping
+/// error handling consistent with how `with.args` is parsed at execution time.
+fn extract_docker_runs_config(
+    definition: Option<&serde_yaml::Value>,
+) -> Result<(Option<String>, Vec<String>), String> {
+    let runs = definition.and_then(|d| d.get("runs"));
+
+    let entrypoint = runs
+        .and_then(|r| r.get("entrypoint"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let args = match runs.and_then(|r| r.get("args")) {
+        Some(v) => {
+            if let Some(seq) = v.as_sequence() {
+                // args as a YAML sequence: ["--flag", "value"]
+                seq.iter()
+                    .map(|v| {
+                        v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                            // Coerce non-string values (int, bool, etc.) to strings,
+                            // matching GitHub Actions behavior.
+                            serde_yaml::to_string(v)
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string()
+                        })
+                    })
+                    .collect()
+            } else if let Some(s) = v.as_str() {
+                // args as a single string: "hello world" → shell-tokenize
+                shlex::split(s).ok_or_else(|| format!("unmatched quote in runs.args: {:?}", s))?
+            } else {
+                vec![]
+            }
+        }
+        None => vec![],
+    };
+
+    Ok((entrypoint, args))
+}
+
 /// Shallow-clone a GitHub repository at a specific ref (branch, tag, or SHA).
 ///
 /// For branch/tag refs, uses `git clone --depth 1 --branch <ref>`.
@@ -657,9 +993,14 @@ async fn shallow_clone(
 ) -> Result<(), ExecutionError> {
     let is_sha = is_git_sha(git_ref);
 
+    // Disable git hooks for all operations — cloned repos are untrusted and
+    // could contain malicious post-checkout / post-merge hooks.
+    let no_hooks = ["-c", "core.hooksPath=/dev/null"];
+
     if is_sha {
         // SHA refs can't use --branch; use init + fetch + checkout instead
         let init = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("init")
             .arg(target_dir)
             .stdout(std::process::Stdio::null())
@@ -675,6 +1016,7 @@ async fn shallow_clone(
         }
 
         let fetch = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("-C")
             .arg(target_dir)
             .arg("fetch")
@@ -701,6 +1043,7 @@ async fn shallow_clone(
         }
 
         let checkout = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("-C")
             .arg(target_dir)
             .arg("checkout")
@@ -724,6 +1067,7 @@ async fn shallow_clone(
     } else {
         // Branch/tag refs: standard shallow clone
         let output = tokio::process::Command::new("git")
+            .args(no_hooks)
             .arg("clone")
             .arg("--depth")
             .arg("1")
@@ -1481,7 +1825,36 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         shallow_clone(&repo_url, &action_info.version, &repo_dir).await?;
                         // If the action has a sub-path, the action.yml is inside that directory
                         let action_dir = match &action_info.sub_path {
-                            Some(p) => repo_dir.join(p),
+                            Some(p) => {
+                                sanitize_sub_path(p).map_err(|e| {
+                                    ExecutionError::Execution(format!(
+                                        "Invalid sub_path for action '{}': {}",
+                                        action_info.repository, e
+                                    ))
+                                })?;
+                                let candidate = repo_dir.join(p);
+                                // Defense-in-depth: verify the resolved path is
+                                // still inside the cloned repo after symlink resolution.
+                                let canon_candidate = candidate.canonicalize().map_err(|e| {
+                                    ExecutionError::Execution(format!(
+                                        "Failed to canonicalize action sub_path: {}",
+                                        e
+                                    ))
+                                })?;
+                                let canon_repo = repo_dir.canonicalize().map_err(|e| {
+                                    ExecutionError::Execution(format!(
+                                        "Failed to canonicalize repo directory: {}",
+                                        e
+                                    ))
+                                })?;
+                                if !canon_candidate.starts_with(&canon_repo) {
+                                    return Err(ExecutionError::Execution(format!(
+                                        "Action sub_path escapes repository directory for action '{}'",
+                                        action_info.repository
+                                    )));
+                                }
+                                candidate
+                            }
                             None => repo_dir,
                         };
                         // tempdir must stay alive until execute_composite_action completes
@@ -1496,6 +1869,22 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         )
                         .await?
                     }
+                }
+                PreparedAction::NativeDocker {
+                    image,
+                    entrypoint,
+                    args,
+                } => {
+                    execute_native_docker_step(
+                        &ctx,
+                        &mut step_env,
+                        step_name,
+                        uses,
+                        image,
+                        entrypoint,
+                        args,
+                    )
+                    .await?
                 }
                 PreparedAction::Image(image) => {
                     // Build command for Docker action
@@ -1767,24 +2156,13 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                         }
                     }
 
-                    // Define the standard workspace path inside the container
                     let container_workspace = Path::new("/github/workspace");
-
-                    // Set up volume mapping from host working dir to container workspace
-                    let mut volumes: Vec<(&Path, &Path)> =
-                        vec![(ctx.working_dir, container_workspace)];
-
-                    // Prepare container mounts and remap GitHub env paths
-                    let (owned_volume_paths, github_mount) =
-                        prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
-                    if let Some((ref host, ref container)) = github_mount {
-                        volumes.push((host.as_path(), container.as_path()));
-                    }
-                    for (host, container) in &owned_volume_paths {
-                        volumes.push((host.as_path(), container.as_path()));
-                    }
-
-                    // Convert environment HashMap to Vec<(&str, &str)> for container runtime
+                    let mount_ctx = prepare_step_container_context(
+                        &mut step_env,
+                        ctx.job_env,
+                        ctx.container_config,
+                    );
+                    let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
                     let env_vars: Vec<(&str, &str)> = step_env
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1798,6 +2176,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             &env_vars,
                             container_workspace,
                             &volumes,
+                            None,
                         )
                         .await
                         .map_err(|e| ExecutionError::Runtime(format!("{}", e)))?;
@@ -1913,20 +2292,9 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         // Define the standard workspace path inside the container
         let container_workspace = Path::new("/github/workspace");
 
-        // Set up volume mapping from host working dir to container workspace
-        let mut volumes: Vec<(&Path, &Path)> = vec![(ctx.working_dir, container_workspace)];
-
-        // Prepare container mounts and remap GitHub env paths
-        let (owned_volume_paths, github_mount) =
-            prepare_container_mounts(&mut step_env, ctx.job_env, ctx.container_config);
-        if let Some((ref host, ref container)) = github_mount {
-            volumes.push((host.as_path(), container.as_path()));
-        }
-        for (host, container) in &owned_volume_paths {
-            volumes.push((host.as_path(), container.as_path()));
-        }
-
-        // Convert environment variables to the required format (after path remapping)
+        let mount_ctx =
+            prepare_step_container_context(&mut step_env, ctx.job_env, ctx.container_config);
+        let volumes = mount_ctx.build_volumes(ctx.working_dir, container_workspace);
         let env_vars: Vec<(&str, &str)> = step_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1941,6 +2309,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                 &env_vars,
                 container_workspace,
                 &volumes,
+                None,
             )
             .await
         {
@@ -2249,6 +2618,52 @@ fn get_effective_runner_image(job: &Job) -> String {
         }
     } else {
         get_runner_image_from_opt(&job.runs_on)
+    }
+}
+
+/// Owned data returned by [`prepare_step_container_context`].
+///
+/// The caller should derive `&[(&Path, &Path)]` and `&[(&str, &str)]` references
+/// from this struct's fields before passing them to `run_container`.
+struct StepContainerContext {
+    owned_volume_paths: Vec<VolumePathPair>,
+    github_mount: Option<VolumePathPair>,
+}
+
+impl StepContainerContext {
+    /// Build the final volumes slice by appending all owned mounts after the
+    /// initial `(working_dir, container_workspace)` pair.
+    fn build_volumes<'a>(
+        &'a self,
+        working_dir: &'a Path,
+        container_workspace: &'a Path,
+    ) -> Vec<(&'a Path, &'a Path)> {
+        let mut volumes: Vec<(&Path, &Path)> = vec![(working_dir, container_workspace)];
+        if let Some((ref host, ref container)) = self.github_mount {
+            volumes.push((host.as_path(), container.as_path()));
+        }
+        for (host, container) in &self.owned_volume_paths {
+            volumes.push((host.as_path(), container.as_path()));
+        }
+        volumes
+    }
+}
+
+/// Set up container volumes and remap GitHub env paths for a step execution.
+///
+/// This is the common setup shared by `NativeDocker`, `Image`, and `run` step
+/// execution paths.  Returns owned mount data; the caller uses
+/// [`StepContainerContext::build_volumes`] to borrow into it.
+fn prepare_step_container_context(
+    step_env: &mut HashMap<String, String>,
+    job_env: &HashMap<String, String>,
+    container_config: Option<&JobContainer>,
+) -> StepContainerContext {
+    let (owned_volume_paths, github_mount) =
+        prepare_container_mounts(step_env, job_env, container_config);
+    StepContainerContext {
+        owned_volume_paths,
+        github_mount,
     }
 }
 
@@ -3523,5 +3938,750 @@ mod tests {
     fn volume_traversal_allows_double_dot_prefix_dir() {
         // A directory literally named "..hidden" is not path traversal
         assert!(!has_path_traversal("/data/..hidden/files"));
+    }
+
+    // --- PreparedAction / NativeDocker tests ---
+
+    #[test]
+    fn prepared_action_native_docker_stores_fields() {
+        let pa = PreparedAction::NativeDocker {
+            image: "ghcr.io/super-linter:latest".to_string(),
+            entrypoint: Some("/entrypoint.sh".to_string()),
+            args: vec!["--flag".to_string(), "value".to_string()],
+        };
+        match pa {
+            PreparedAction::NativeDocker {
+                image,
+                entrypoint,
+                args,
+            } => {
+                assert_eq!(image, "ghcr.io/super-linter:latest");
+                assert_eq!(entrypoint.as_deref(), Some("/entrypoint.sh"));
+                assert_eq!(args, vec!["--flag", "value"]);
+            }
+            _ => panic!("expected NativeDocker variant"),
+        }
+    }
+
+    #[test]
+    fn prepared_action_native_docker_defaults() {
+        let pa = PreparedAction::NativeDocker {
+            image: "alpine:latest".to_string(),
+            entrypoint: None,
+            args: vec![],
+        };
+        match pa {
+            PreparedAction::NativeDocker {
+                entrypoint, args, ..
+            } => {
+                assert!(entrypoint.is_none());
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected NativeDocker variant"),
+        }
+    }
+
+    // --- extract_docker_runs_config tests ---
+
+    #[test]
+    fn extract_runs_config_with_entrypoint_and_args() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: /entrypoint.sh
+  args:
+    - --flag
+    - value
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert_eq!(ep.as_deref(), Some("/entrypoint.sh"));
+        assert_eq!(args, vec!["--flag", "value"]);
+    }
+
+    #[test]
+    fn extract_runs_config_missing_both() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert!(ep.is_none());
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_runs_config_none_definition() {
+        let (ep, args) = extract_docker_runs_config(None).unwrap();
+        assert!(ep.is_none());
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_runs_config_entrypoint_only() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: /custom.sh
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert_eq!(ep.as_deref(), Some("/custom.sh"));
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_runs_config_args_only() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args:
+    - hello
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert!(ep.is_none());
+        assert_eq!(args, vec!["hello"]);
+    }
+
+    #[test]
+    fn extract_runs_config_args_as_string() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args: "--flag value 'quoted arg'"
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert!(ep.is_none());
+        assert_eq!(args, vec!["--flag", "value", "quoted arg"]);
+    }
+
+    #[test]
+    fn extract_runs_config_args_as_plain_string() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args: hello
+"#,
+        )
+        .unwrap();
+        let (ep, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert!(ep.is_none());
+        assert_eq!(args, vec!["hello"]);
+    }
+
+    #[test]
+    fn extract_runs_config_args_string_bad_quoting_is_error() {
+        // Unmatched quote — should return an error (consistent with with.args parsing)
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args: "hello 'world"
+"#,
+        )
+        .unwrap();
+        let result = extract_docker_runs_config(Some(&yaml));
+        assert!(result.is_err(), "unmatched quote should return Err");
+        assert!(result.unwrap_err().contains("unmatched quote"));
+    }
+
+    // --- Dockerfile path sanitization tests ---
+
+    #[test]
+    fn dockerfile_rel_strips_docker_prefix() {
+        assert_eq!(
+            sanitize_dockerfile_rel("docker://Dockerfile").unwrap(),
+            "Dockerfile"
+        );
+    }
+
+    #[test]
+    fn dockerfile_rel_strips_leading_slash() {
+        assert_eq!(
+            sanitize_dockerfile_rel("docker:///etc/Dockerfile").unwrap(),
+            "etc/Dockerfile"
+        );
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_dotdot_traversal() {
+        assert!(sanitize_dockerfile_rel("docker://../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_dotdot_in_middle() {
+        assert!(sanitize_dockerfile_rel("subdir/../../../etc/shadow").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_backslash_traversal() {
+        assert!(sanitize_dockerfile_rel("..\\..\\etc\\shadow").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_mixed_separator_traversal() {
+        assert!(sanitize_dockerfile_rel("subdir\\..\\..\\etc/shadow").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_plain_dockerfile() {
+        assert_eq!(sanitize_dockerfile_rel("Dockerfile").unwrap(), "Dockerfile");
+    }
+
+    #[test]
+    fn dockerfile_rel_relative_path() {
+        assert_eq!(
+            sanitize_dockerfile_rel("./build/Dockerfile").unwrap(),
+            "build/Dockerfile"
+        );
+    }
+
+    #[test]
+    fn dockerfile_rel_allows_dotdot_in_filename() {
+        // ".." as a substring in a filename is not path traversal
+        assert_eq!(
+            sanitize_dockerfile_rel("foo..bar/Dockerfile").unwrap(),
+            "foo..bar/Dockerfile"
+        );
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_empty_string() {
+        assert!(sanitize_dockerfile_rel("").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_docker_prefix_only() {
+        assert!(sanitize_dockerfile_rel("docker://").is_err());
+    }
+
+    // --- sub_path sanitization tests ---
+
+    #[test]
+    fn sub_path_allows_simple_path() {
+        assert!(sanitize_sub_path("subdir").is_ok());
+    }
+
+    #[test]
+    fn sub_path_allows_nested_path() {
+        assert!(sanitize_sub_path("a/b/c").is_ok());
+    }
+
+    #[test]
+    fn sub_path_rejects_dotdot() {
+        assert!(sanitize_sub_path("..").is_err());
+    }
+
+    #[test]
+    fn sub_path_rejects_dotdot_prefix() {
+        assert!(sanitize_sub_path("../../etc").is_err());
+    }
+
+    #[test]
+    fn sub_path_rejects_dotdot_in_middle() {
+        assert!(sanitize_sub_path("a/../../../etc").is_err());
+    }
+
+    #[test]
+    fn sub_path_allows_dotdot_in_name() {
+        // ".." as a substring in a directory name is not traversal
+        assert!(sanitize_sub_path("foo..bar").is_ok());
+    }
+
+    // --- null byte rejection tests ---
+
+    #[test]
+    fn sub_path_rejects_null_byte() {
+        assert!(sanitize_sub_path("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn dockerfile_rel_rejects_null_byte() {
+        assert!(sanitize_dockerfile_rel("Dockerfile\0.txt").is_err());
+    }
+
+    // --- extract_docker_runs_config with numeric/bool args ---
+
+    #[test]
+    fn extract_runs_config_args_coerces_non_string_values() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  args:
+    - 42
+    - true
+    - --flag
+"#,
+        )
+        .unwrap();
+        let (_, args) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "42");
+        assert_eq!(args[1], "true");
+        assert_eq!(args[2], "--flag");
+    }
+
+    // --- Mock ContainerRuntime for NativeDocker integration tests ---
+
+    use std::sync::{Arc, Mutex};
+    use wrkflw_runtime::container::{ContainerError, ContainerOutput};
+
+    /// Records all `run_container` calls for later assertion.
+    #[derive(Clone, Default)]
+    struct MockContainerRuntime {
+        run_calls: Arc<Mutex<Vec<RunContainerCall>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RunContainerCall {
+        image: String,
+        cmd: Vec<String>,
+        env_vars: Vec<(String, String)>,
+        entrypoint: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntime for MockContainerRuntime {
+        async fn run_container(
+            &self,
+            image: &str,
+            cmd: &[&str],
+            env_vars: &[(&str, &str)],
+            _working_dir: &Path,
+            _volumes: &[(&Path, &Path)],
+            entrypoint: Option<&str>,
+        ) -> Result<ContainerOutput, ContainerError> {
+            self.run_calls.lock().unwrap().push(RunContainerCall {
+                image: image.to_string(),
+                cmd: cmd.iter().map(|s| s.to_string()).collect(),
+                env_vars: env_vars
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                entrypoint: entrypoint.map(|s| s.to_string()),
+            });
+            Ok(ContainerOutput {
+                stdout: "mock ok".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn build_image(
+            &self,
+            _dockerfile: &Path,
+            _tag: &str,
+            _context_dir: &Path,
+        ) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
+        async fn prepare_language_environment(
+            &self,
+            _language: &str,
+            _version: Option<&str>,
+            _additional_packages: Option<Vec<String>>,
+        ) -> Result<String, ContainerError> {
+            Ok("mock-image:latest".to_string())
+        }
+    }
+
+    /// Helper to build a minimal `WorkflowDefinition`.
+    fn minimal_workflow() -> WorkflowDefinition {
+        WorkflowDefinition {
+            name: "test".to_string(),
+            on: vec![],
+            on_raw: serde_yaml::Value::Null,
+            jobs: Default::default(),
+        }
+    }
+
+    /// Helper to build a `Step` with sensible defaults (Step doesn't derive Default).
+    fn make_step(
+        name: &str,
+        uses: &str,
+        with: Option<HashMap<String, String>>,
+        env: HashMap<String, String>,
+    ) -> Step {
+        Step {
+            name: Some(name.to_string()),
+            uses: Some(uses.to_string()),
+            run: None,
+            with,
+            env,
+            continue_on_error: None,
+            if_condition: None,
+            id: None,
+            working_directory: None,
+            shell: None,
+            timeout_minutes: None,
+        }
+    }
+
+    // --- NativeDocker execute_step integration tests ---
+
+    #[tokio::test]
+    async fn native_docker_passes_entrypoint_and_args() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        // Step uses a docker:// image — triggers NativeDocker path via prepare_action
+        let step = make_step("docker-step", "docker://alpine:3.18", None, HashMap::new());
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.image, "alpine:3.18");
+        // docker:// actions have no runs.entrypoint — uses image default
+        assert!(call.entrypoint.is_none());
+        // No args either — uses image CMD
+        assert!(call.cmd.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_docker_with_args_override() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("args".to_string(), "hello world".to_string());
+        with.insert("myinput".to_string(), "myvalue".to_string());
+
+        let step = make_step(
+            "docker-args-step",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        // with.args should be shell-tokenized into the CMD
+        assert_eq!(call.cmd, vec!["hello", "world"]);
+        // INPUT_* env vars should be set
+        let env_map: HashMap<&str, &str> = call
+            .env_vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env_map.get("INPUT_ARGS"), Some(&"hello world"));
+        assert_eq!(env_map.get("INPUT_MYINPUT"), Some(&"myvalue"));
+    }
+
+    #[tokio::test]
+    async fn native_docker_empty_with_args_passes_zero_args() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        // Empty string means "pass zero args" — overrides any runs.args
+        with.insert("args".to_string(), String::new());
+
+        let step = make_step(
+            "docker-empty-args",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].cmd.is_empty(),
+            "empty with.args should yield zero CMD args"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_docker_step_env_injected() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let mut job_env = HashMap::new();
+        job_env.insert("JOB_VAR".to_string(), "from-job".to_string());
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut step_env_map = HashMap::new();
+        step_env_map.insert("STEP_VAR".to_string(), "from-step".to_string());
+
+        let step = make_step(
+            "docker-env-step",
+            "docker://alpine:3.18",
+            None,
+            step_env_map,
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        let env_map: HashMap<&str, &str> = calls[0]
+            .env_vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env_map.get("JOB_VAR"), Some(&"from-job"));
+        assert_eq!(env_map.get("STEP_VAR"), Some(&"from-step"));
+    }
+
+    #[tokio::test]
+    async fn native_docker_with_args_unmatched_quote_is_error() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("args".to_string(), "hello 'world".to_string());
+
+        let step = make_step(
+            "docker-bad-args",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await;
+        assert!(result.is_err(), "unmatched quote in with.args should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unmatched quote"),
+            "error should mention unmatched quote, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn native_docker_runs_args_overridden_by_with_args() {
+        // When both runs.args (from action.yml) and with.args (from workflow)
+        // are present, with.args should win — matching GitHub Actions behavior.
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("args".to_string(), "override-arg".to_string());
+
+        let step = make_step(
+            "docker-override-step",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // with.args takes precedence over any runs.args the action may have
+        assert_eq!(calls[0].cmd, vec!["override-arg"]);
+    }
+
+    #[tokio::test]
+    async fn native_docker_with_entrypoint_override() {
+        let runtime = MockContainerRuntime::default();
+        let workflow = minimal_workflow();
+        let job_env = HashMap::new();
+        let working_dir = std::env::current_dir().unwrap();
+
+        let mut with = HashMap::new();
+        with.insert("entrypoint".to_string(), "/custom.sh".to_string());
+        with.insert("args".to_string(), "hello".to_string());
+
+        let step = make_step(
+            "docker-ep-override",
+            "docker://alpine:3.18",
+            Some(with),
+            HashMap::new(),
+        );
+
+        let ctx = StepExecutionContext {
+            step: &step,
+            step_idx: 0,
+            job_env: &job_env,
+            working_dir: &working_dir,
+            runtime: &runtime,
+            workflow: &workflow,
+            runner_image: "ubuntu:latest",
+            verbose: false,
+            matrix_combination: &None,
+            secret_manager: None,
+            secret_masker: None,
+            container_config: None,
+        };
+
+        let result = execute_step(ctx).await.unwrap();
+        assert_eq!(result.status, StepStatus::Success);
+
+        let calls = runtime.run_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        // with.entrypoint should override the image default
+        assert_eq!(call.entrypoint.as_deref(), Some("/custom.sh"));
+        assert_eq!(call.cmd, vec!["hello"]);
+    }
+
+    #[test]
+    fn extract_runs_config_empty_entrypoint_treated_as_none() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+runs:
+  using: docker
+  image: Dockerfile
+  entrypoint: ""
+"#,
+        )
+        .unwrap();
+        let (ep, _) = extract_docker_runs_config(Some(&yaml)).unwrap();
+        assert!(
+            ep.is_none(),
+            "empty entrypoint string should be treated as None"
+        );
+    }
+
+    // --- sub_path backslash traversal tests ---
+
+    #[test]
+    fn sub_path_rejects_backslash_dotdot() {
+        assert!(sanitize_sub_path("a\\..\\..\\etc").is_err());
+    }
+
+    #[test]
+    fn sub_path_rejects_mixed_separator_dotdot() {
+        assert!(sanitize_sub_path("a/..\\..\\etc").is_err());
     }
 }

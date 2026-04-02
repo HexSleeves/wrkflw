@@ -266,7 +266,8 @@ impl DockerRuntime {
 
         // Build the customized image
         let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
-        self.build_image(&dockerfile_path, &image_tag).await?;
+        self.build_image(&dockerfile_path, &image_tag, temp_dir.path())
+            .await?;
 
         // Store the customized image
         Self::set_language_specific_image("", language, version, &image_tag);
@@ -635,6 +636,7 @@ impl ContainerRuntime for DockerRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Docker: Running container with image: {}", image));
@@ -645,7 +647,7 @@ impl ContainerRuntime for DockerRuntime {
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
             timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes),
+            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
         )
         .await
         {
@@ -676,11 +678,20 @@ impl ContainerRuntime for DockerRuntime {
         }
     }
 
-    async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         // Add a timeout for build operations
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minutes timeout for builds
 
-        match tokio::time::timeout(timeout_duration, self.build_image_inner(dockerfile, tag)).await
+        match tokio::time::timeout(
+            timeout_duration,
+            self.build_image_inner(dockerfile, tag, context_dir),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => {
@@ -821,7 +832,8 @@ impl ContainerRuntime for DockerRuntime {
 
         // Build the customized image
         let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
-        self.build_image(&dockerfile_path, &image_tag).await?;
+        self.build_image(&dockerfile_path, &image_tag, temp_dir.path())
+            .await?;
 
         // Store the customized image
         Self::set_language_specific_image("", language, version, &image_tag);
@@ -839,6 +851,7 @@ impl DockerRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // First, try to pull the image if it's not available locally
         if let Err(e) = self.pull_image_inner(image).await {
@@ -865,6 +878,7 @@ impl DockerRuntime {
 
         // Convert command vector to Vec<String>
         let cmd_vec: Vec<String> = cmd.iter().map(|&s| s.to_string()).collect();
+        let has_cmd = !cmd_vec.is_empty();
 
         wrkflw_logging::debug(&format!("Running command in Docker: {:?}", cmd_vec));
         wrkflw_logging::debug(&format!("Environment: {:?}", env));
@@ -915,7 +929,8 @@ impl DockerRuntime {
         // Create container config with platform-specific settings
         let mut config = Config {
             image: Some(image.to_string()),
-            cmd: Some(cmd_vec),
+            // Empty cmd means "use the image's built-in ENTRYPOINT/CMD"
+            cmd: if has_cmd { Some(cmd_vec) } else { None },
             env: Some(env),
             working_dir: Some(working_dir.to_string_lossy().to_string()),
             host_config: Some(host_config),
@@ -925,8 +940,14 @@ impl DockerRuntime {
             } else {
                 None // Don't specify user for macOS emulation - use default root user
             },
-            // Map appropriate entrypoint for different platforms
-            entrypoint: if is_macos_emu {
+            // Map appropriate entrypoint for different platforms.
+            // Priority: explicit entrypoint from action.yml > macOS bash wrapper > image default.
+            // Only apply the macOS bash wrapper when there is an explicit command to wrap;
+            // an empty cmd means "use the image's native ENTRYPOINT/CMD"
+            // and overriding it with bash would hang or discard the real entrypoint.
+            entrypoint: if let Some(ep) = entrypoint.filter(|s| !s.is_empty()) {
+                Some(vec![ep.to_string()])
+            } else if is_macos_emu && has_cmd {
                 // For macOS, ensure we use bash
                 Some(vec!["bash".to_string(), "-l".to_string(), "-c".to_string()])
             } else {
@@ -1094,50 +1115,112 @@ impl DockerRuntime {
         Ok(())
     }
 
-    async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
-        let _context_dir = dockerfile.parent().unwrap_or(Path::new("."));
+    /// Build a Docker image from a Dockerfile.
+    ///
+    /// `context_dir` is the Docker build context directory. Files in this
+    /// directory are sent to the Docker daemon so that COPY instructions work.
+    /// The Dockerfile path is made relative to this context for the build API.
+    ///
+    /// If a `.dockerignore` file exists in the context directory, its patterns
+    /// are honoured to exclude files from the build context — reducing the
+    /// amount of data sent to the daemon for large action repositories.
+    ///
+    /// **Note:** `follow_symlinks(false)` protects against symlink-based
+    /// exfiltration but does not prevent hard-links to files outside the
+    /// context.  This is acceptable because the context is always a freshly
+    /// cloned repo or tempdir that we control.
+    async fn build_image_inner(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
+        if !dockerfile.exists() {
+            return Err(ContainerError::ImageBuild(format!(
+                "Cannot open Dockerfile at {}",
+                dockerfile.display()
+            )));
+        }
 
+        // Determine the Dockerfile path relative to the context directory.
+        let dockerfile_name = dockerfile
+            .strip_prefix(context_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .map_err(|_| {
+                ContainerError::ImageBuild(format!(
+                    "Dockerfile {} is not within context directory {}",
+                    dockerfile.display(),
+                    context_dir.display()
+                ))
+            })?;
+
+        // Maximum build context size (500 MB). Prevents OOM when an action
+        // repo is unexpectedly large and has no .dockerignore.
+        const MAX_CONTEXT_BYTES: u64 = 500 * 1024 * 1024;
+
+        // TODO: For large build contexts (approaching MAX_CONTEXT_BYTES), consider
+        // streaming the tar to a temporary file instead of holding it all in memory.
         let tar_buffer = {
             let mut tar_builder = tar::Builder::new(Vec::new());
 
-            // Add Dockerfile to tar
-            if let Ok(file) = std::fs::File::open(dockerfile) {
-                let mut header = tar::Header::new_gnu();
-                let metadata = file.metadata().map_err(|e| {
-                    ContainerError::ContainerExecution(format!(
-                        "Failed to get file metadata: {}",
-                        e
-                    ))
-                })?;
-                let modified_time = metadata
-                    .modified()
-                    .map_err(|e| {
-                        ContainerError::ContainerExecution(format!(
-                            "Failed to get file modification time: {}",
-                            e
-                        ))
-                    })?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| {
-                        ContainerError::ContainerExecution(format!(
-                            "Failed to convert modification time to Unix timestamp: {}",
-                            e
-                        ))
-                    })?
-                    .as_secs();
-                header.set_size(metadata.len());
-                header.set_mode(0o644);
-                header.set_mtime(modified_time);
-                header.set_cksum();
+            // Do not follow symlinks — untrusted action repos could use symlinks
+            // to leak host filesystem contents into the Docker build context.
+            tar_builder.follow_symlinks(false);
 
-                tar_builder
-                    .append_data(&mut header, "Dockerfile", file)
-                    .map_err(|e| ContainerError::ImageBuild(e.to_string()))?;
-            } else {
-                return Err(ContainerError::ImageBuild(format!(
-                    "Cannot open Dockerfile at {}",
-                    dockerfile.display()
-                )));
+            // Track cumulative size so we can enforce MAX_CONTEXT_BYTES.
+            let mut total_bytes: u64 = 0;
+
+            // Build a context walker. When a .dockerignore exists, its patterns
+            // are used to exclude files (same glob semantics as Docker).
+            use ignore::WalkBuilder;
+
+            let dockerignore_path = context_dir.join(".dockerignore");
+            let mut walker_builder = WalkBuilder::new(context_dir);
+            // Disable default .gitignore / .ignore handling — we only want
+            // .dockerignore semantics when the file is present.
+            walker_builder.standard_filters(false).follow_links(false);
+            if dockerignore_path.exists() {
+                walker_builder.add_custom_ignore_filename(".dockerignore");
+            }
+
+            for entry in walker_builder.build() {
+                let entry = entry.map_err(|e| {
+                    ContainerError::ImageBuild(format!("Failed to walk build context: {}", e))
+                })?;
+                let path = entry.path();
+                let rel = match path.strip_prefix(context_dir) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                // Skip the root directory itself — tar implicitly contains it.
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                if path.is_dir() {
+                    tar_builder.append_dir(rel, path).map_err(|e| {
+                        ContainerError::ImageBuild(format!(
+                            "Failed to add directory to build context tar: {}",
+                            e
+                        ))
+                    })?;
+                } else {
+                    if let Ok(meta) = path.metadata() {
+                        total_bytes += meta.len();
+                        if total_bytes > MAX_CONTEXT_BYTES {
+                            return Err(ContainerError::ImageBuild(format!(
+                                "Docker build context exceeds {} MB limit. \
+                                 Add a .dockerignore file to exclude unnecessary files.",
+                                MAX_CONTEXT_BYTES / (1024 * 1024)
+                            )));
+                        }
+                    }
+                    tar_builder.append_path_with_name(path, rel).map_err(|e| {
+                        ContainerError::ImageBuild(format!(
+                            "Failed to add file to build context tar: {}",
+                            e
+                        ))
+                    })?;
+                }
             }
 
             tar_builder
@@ -1146,7 +1229,7 @@ impl DockerRuntime {
         };
 
         let options = bollard::image::BuildImageOptions {
-            dockerfile: "Dockerfile",
+            dockerfile: dockerfile_name.as_str(),
             t: tag,
             q: false,
             nocache: false,

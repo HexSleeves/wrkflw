@@ -153,6 +153,7 @@ impl ContainerRuntime for EmulationRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         _volumes: &[(&Path, &Path)],
+        _entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Build command string
         let mut command_str = String::new();
@@ -169,9 +170,20 @@ impl ContainerRuntime for EmulationRuntime {
         wrkflw_logging::info(&format!("Command length: {}", command.len()));
 
         if command.is_empty() {
-            return Err(ContainerError::ContainerExecution(
-                "Empty command array".to_string(),
-            ));
+            // Empty cmd means "use the image's built-in ENTRYPOINT/CMD".
+            // Emulation mode cannot run Docker images natively, so return
+            // a descriptive message instead of erroring.
+            wrkflw_logging::warning(
+                "Emulation mode cannot run Docker actions with native entrypoints. \
+                 Use --runtime docker for full Docker action support.",
+            );
+            return Ok(ContainerOutput {
+                stdout: String::new(),
+                stderr: "Emulation mode: skipped Docker action (requires --runtime docker). \
+                         The action was NOT executed."
+                    .to_string(),
+                exit_code: 1,
+            });
         }
 
         // Print each command part separately for debugging
@@ -391,7 +403,12 @@ impl ContainerRuntime for EmulationRuntime {
         Ok(())
     }
 
-    async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        _context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         wrkflw_logging::info(&format!(
             "🔄 Emulation: Pretending to build image {} from {}",
             tag,
@@ -842,10 +859,34 @@ mod tests {
                 &[],
                 Path::new("."),
                 &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
             )
             .await;
 
         let output = result.expect("non-zero exit should return Ok, not Err");
         assert_eq!(output.exit_code, 42);
+    }
+
+    #[tokio::test]
+    async fn test_empty_cmd_returns_failure_in_emulation() {
+        let runtime = EmulationRuntime::new();
+        let result = runtime
+            .run_container(
+                "some-action:latest",
+                &[],
+                &[],
+                Path::new("."),
+                &[(Path::new("."), Path::new("/github/workspace"))],
+                None,
+            )
+            .await;
+
+        let output = result.expect("empty cmd should return Ok with exit_code 1, not Err");
+        assert_eq!(output.exit_code, 1, "empty cmd should signal failure");
+        assert!(
+            output.stderr.contains("skipped Docker action"),
+            "stderr should explain the action was not executed"
+        );
+        assert!(output.stdout.is_empty(), "stdout should be empty");
     }
 }

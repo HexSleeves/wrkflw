@@ -47,7 +47,16 @@ impl ContainerRuntime for SecureEmulationRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         _volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
+        if let Some(ep) = entrypoint {
+            wrkflw_logging::warning(&format!(
+                "Secure emulation mode ignoring entrypoint override '{}' for image '{}'. \
+                 Use --runtime docker for full Docker action support.",
+                ep, image
+            ));
+        }
+
         wrkflw_logging::info(&format!(
             "🔒 Executing sandboxed command: {} (image: {})",
             command.join(" "),
@@ -128,7 +137,12 @@ impl ContainerRuntime for SecureEmulationRuntime {
         Ok(())
     }
 
-    async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        _context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         wrkflw_logging::info(&format!(
             "🔒 Secure emulation: Pretending to build image {} from {}",
             tag,
@@ -308,6 +322,7 @@ mod tests {
                 &[],
                 &PathBuf::from("."),
                 &[],
+                None,
             )
             .await;
 
@@ -328,6 +343,7 @@ mod tests {
                 &[],
                 &PathBuf::from("."),
                 &[],
+                None,
             )
             .await;
 

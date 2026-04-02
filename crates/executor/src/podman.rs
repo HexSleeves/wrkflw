@@ -470,6 +470,7 @@ impl ContainerRuntime for PodmanRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         // Print detailed debugging info
         wrkflw_logging::info(&format!("Podman: Running container with image: {}", image));
@@ -479,7 +480,7 @@ impl ContainerRuntime for PodmanRuntime {
         // Run the entire container operation with a timeout
         match tokio::time::timeout(
             timeout_duration,
-            self.run_container_inner(image, cmd, env_vars, working_dir, volumes),
+            self.run_container_inner(image, cmd, env_vars, working_dir, volumes, entrypoint),
         )
         .await
         {
@@ -510,11 +511,20 @@ impl ContainerRuntime for PodmanRuntime {
         }
     }
 
-    async fn build_image(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
+    async fn build_image(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         // Add a timeout for build operations
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minutes timeout for builds
 
-        match tokio::time::timeout(timeout_duration, self.build_image_inner(dockerfile, tag)).await
+        match tokio::time::timeout(
+            timeout_duration,
+            self.build_image_inner(dockerfile, tag, context_dir),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => {
@@ -655,7 +665,8 @@ impl ContainerRuntime for PodmanRuntime {
 
         // Build the customized image
         let image_tag = format!("wrkflw-{}-{}", language, version.unwrap_or("latest"));
-        self.build_image(&dockerfile_path, &image_tag).await?;
+        self.build_image(&dockerfile_path, &image_tag, temp_dir.path())
+            .await?;
 
         // Store the customized image
         Self::set_language_specific_image("", language, version, &image_tag);
@@ -673,6 +684,7 @@ impl PodmanRuntime {
         env_vars: &[(&str, &str)],
         working_dir: &Path,
         volumes: &[(&Path, &Path)],
+        entrypoint: Option<&str>,
     ) -> Result<ContainerOutput, ContainerError> {
         wrkflw_logging::debug(&format!("Running command in Podman: {:?}", cmd));
         wrkflw_logging::debug(&format!("Environment: {:?}", env_vars));
@@ -720,10 +732,19 @@ impl PodmanRuntime {
             args.push(volume_string);
         }
 
+        // Override entrypoint if specified by action.yml
+        let ep_string;
+        if let Some(ep) = entrypoint.filter(|s| !s.is_empty()) {
+            ep_string = ep.to_string();
+            args.push("--entrypoint");
+            args.push(&ep_string);
+        }
+
         // Add the image
         args.push(image);
 
-        // Add the command
+        // Add the command. If cmd is empty, nothing is appended and the
+        // image's built-in ENTRYPOINT/CMD is used.
         args.extend(cmd);
 
         // Track the container (even though we use --rm, track it for consistency)
@@ -847,8 +868,12 @@ impl PodmanRuntime {
         Ok(())
     }
 
-    async fn build_image_inner(&self, dockerfile: &Path, tag: &str) -> Result<(), ContainerError> {
-        let context_dir = dockerfile.parent().unwrap_or(Path::new("."));
+    async fn build_image_inner(
+        &self,
+        dockerfile: &Path,
+        tag: &str,
+        context_dir: &Path,
+    ) -> Result<(), ContainerError> {
         let dockerfile_str = dockerfile.to_string_lossy().to_string();
         let context_dir_str = context_dir.to_string_lossy().to_string();
         let args = vec!["build", "-f", &dockerfile_str, "-t", tag, &context_dir_str];
