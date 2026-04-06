@@ -10,6 +10,9 @@
 use serde_yaml::Value;
 use std::collections::HashMap;
 
+// serde_json is used by toJSON() for robust string escaping.
+use serde_json;
+
 // ---------------------------------------------------------------------------
 // Value type
 // ---------------------------------------------------------------------------
@@ -80,20 +83,18 @@ enum Token {
 }
 
 struct Tokenizer<'a> {
-    input: &'a [u8],
-    pos: usize,
+    input: &'a str,
+    pos: usize, // byte offset into `input`
 }
 
 impl<'a> Tokenizer<'a> {
     fn new(input: &'a str) -> Self {
-        Self {
-            input: input.as_bytes(),
-            pos: 0,
-        }
+        Self { input, pos: 0 }
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len() && bytes[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
@@ -106,7 +107,8 @@ impl<'a> Tokenizer<'a> {
                 tokens.push(Token::Eof);
                 return Ok(tokens);
             }
-            let ch = self.input[self.pos] as char;
+            let bytes = self.input.as_bytes();
+            let ch = bytes[self.pos] as char;
             match ch {
                 '.' => {
                     tokens.push(Token::Dot);
@@ -125,7 +127,7 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 1;
                 }
                 '=' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Eq);
                         self.pos += 2;
                     } else {
@@ -133,7 +135,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '!' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Ne);
                         self.pos += 2;
                     } else {
@@ -142,7 +144,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '<' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Le);
                         self.pos += 2;
                     } else {
@@ -151,7 +153,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '>' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next_byte() == Some(b'=') {
                         tokens.push(Token::Ge);
                         self.pos += 2;
                     } else {
@@ -160,7 +162,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '&' => {
-                    if self.peek_next() == Some('&') {
+                    if self.peek_next_byte() == Some(b'&') {
                         tokens.push(Token::And);
                         self.pos += 2;
                     } else {
@@ -168,7 +170,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 '|' => {
-                    if self.peek_next() == Some('|') {
+                    if self.peek_next_byte() == Some(b'|') {
                         tokens.push(Token::Or);
                         self.pos += 2;
                     } else {
@@ -191,31 +193,38 @@ impl<'a> Tokenizer<'a> {
                     });
                 }
                 _ => {
+                    // Decode the actual char at this position for the error message
+                    let actual_ch = self.input[self.pos..].chars().next().unwrap_or(ch);
                     return Err(format!(
                         "unexpected character '{}' at position {}",
-                        ch, self.pos
-                    ))
+                        actual_ch, self.pos
+                    ));
                 }
             }
         }
     }
 
-    fn peek_next(&self) -> Option<char> {
-        if self.pos + 1 < self.input.len() {
-            Some(self.input[self.pos + 1] as char)
+    /// Peek at the next byte (used only for ASCII operator lookahead).
+    fn peek_next_byte(&self) -> Option<u8> {
+        let bytes = self.input.as_bytes();
+        if self.pos + 1 < bytes.len() {
+            Some(bytes[self.pos + 1])
         } else {
             None
         }
     }
 
+    /// Read a single-quoted string literal, handling multi-byte UTF-8 correctly.
     fn read_string(&mut self) -> Result<Token, String> {
         self.pos += 1; // skip opening quote
         let mut s = String::new();
         while self.pos < self.input.len() {
-            let ch = self.input[self.pos] as char;
+            // Iterate chars from current position to handle multi-byte correctly
+            let ch = self.input[self.pos..].chars().next().unwrap();
             if ch == '\'' {
                 // Check for escaped quote ('')
-                if self.peek_next() == Some('\'') {
+                let next_pos = self.pos + 1;
+                if next_pos < self.input.len() && self.input.as_bytes()[next_pos] == b'\'' {
                     s.push('\'');
                     self.pos += 2;
                 } else {
@@ -224,7 +233,7 @@ impl<'a> Tokenizer<'a> {
                 }
             } else {
                 s.push(ch);
-                self.pos += 1;
+                self.pos += ch.len_utf8();
             }
         }
         Err("unterminated string literal".to_string())
@@ -232,13 +241,13 @@ impl<'a> Tokenizer<'a> {
 
     fn read_number(&mut self) -> Result<Token, String> {
         let start = self.pos;
-        while self.pos < self.input.len()
-            && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'.')
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len()
+            && (bytes[self.pos].is_ascii_digit() || bytes[self.pos] == b'.')
         {
             self.pos += 1;
         }
-        let s = std::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|e| format!("invalid number: {}", e))?;
+        let s = &self.input[start..self.pos];
         let n: f64 = s
             .parse()
             .map_err(|e| format!("invalid number '{}': {}", s, e))?;
@@ -247,15 +256,16 @@ impl<'a> Tokenizer<'a> {
 
     fn read_ident(&mut self) -> String {
         let start = self.pos;
-        while self.pos < self.input.len() {
-            let ch = self.input[self.pos];
+        let bytes = self.input.as_bytes();
+        while self.pos < bytes.len() {
+            let ch = bytes[self.pos];
             if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-' {
                 self.pos += 1;
             } else {
                 break;
             }
         }
-        String::from_utf8_lossy(&self.input[start..self.pos]).to_string()
+        self.input[start..self.pos].to_string()
     }
 }
 
@@ -268,6 +278,18 @@ pub struct ExpressionContext<'a> {
     pub env_context: &'a HashMap<String, String>,
     pub step_outputs: &'a HashMap<String, HashMap<String, String>>,
     pub matrix_combination: &'a Option<HashMap<String, Value>>,
+    /// Step ID → (outcome, conclusion) where values are "success", "failure", or "skipped".
+    /// `outcome` is the raw result before `continue-on-error`; `conclusion` is the effective result.
+    pub step_statuses: &'a HashMap<String, (String, String)>,
+    /// Current job status for `success()`/`failure()`/`cancelled()` builtins:
+    /// "success", "failure", or "cancelled".
+    pub job_status: &'a str,
+    /// Pre-resolved secrets for `secrets.*` context.
+    pub secrets_context: &'a HashMap<String, String>,
+    /// Job outputs from upstream jobs: `job_name -> { output_key -> output_value }`.
+    pub needs_context: &'a HashMap<String, HashMap<String, String>>,
+    /// Job results from upstream jobs: `job_name -> "success" | "failure" | "skipped"`.
+    pub needs_results: &'a HashMap<String, String>,
 }
 
 impl<'a> ExpressionContext<'a> {
@@ -292,8 +314,18 @@ impl<'a> ExpressionContext<'a> {
                 .get(&parts[1])
                 .map(|v| ExprValue::String(v.clone()))
                 .unwrap_or(ExprValue::Null),
-            "github" if parts.len() == 2 => {
-                let env_key = format!("GITHUB_{}", parts[1].to_uppercase());
+            "github" if parts.len() >= 2 => {
+                // Support nested github context like github.event.action,
+                // github.event.pull_request.number, etc.
+                // Map dotted path to GITHUB_ env var with underscores.
+                //
+                // LIMITATION: In real GitHub Actions, `github.event.*` is a deep
+                // JSON object parsed from the webhook payload (`$GITHUB_EVENT_PATH`).
+                // Here we approximate it via flat GITHUB_* environment variables,
+                // which works for simple top-level properties (e.g. `github.event.action`,
+                // `github.ref_name`) but will return Null for deeply-nested event
+                // properties that don't have a corresponding env var.
+                let env_key = format!("GITHUB_{}", parts[1..].join("_").to_uppercase());
                 self.env_context
                     .get(&env_key)
                     .map(|v| ExprValue::String(v.clone()))
@@ -322,13 +354,43 @@ impl<'a> ExpressionContext<'a> {
                 .and_then(|m| m.get(&parts[3]))
                 .map(|v| ExprValue::String(v.clone()))
                 .unwrap_or(ExprValue::Null),
-            "steps" if parts.len() == 3 && parts[2] == "outcome" => {
-                // We don't track step outcome; default to "success"
-                ExprValue::String("success".to_string())
-            }
-            "steps" if parts.len() == 3 && parts[2] == "conclusion" => {
-                ExprValue::String("success".to_string())
-            }
+            "needs" if parts.len() == 4 && parts[2] == "outputs" => self
+                .needs_context
+                .get(&parts[1])
+                .and_then(|m| m.get(&parts[3]))
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            "needs" if parts.len() == 3 && parts[2] == "result" => self
+                .needs_results
+                .get(&parts[1])
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            // jobs.* context — In real GitHub Actions, this is only available in
+            // workflow_call output mapping contexts, not in step expressions. We alias
+            // it to needs.* data here as a pragmatic approximation that covers the most
+            // common use case (reusable workflow outputs). Note: jobs.*.result does not
+            // exist in real GHA (only needs.*.result does), so we only support outputs.
+            "jobs" if parts.len() == 4 && parts[2] == "outputs" => self
+                .needs_context
+                .get(&parts[1])
+                .and_then(|m| m.get(&parts[3]))
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            "secrets" if parts.len() == 2 => self
+                .secrets_context
+                .get(&parts[1])
+                .map(|v| ExprValue::String(v.clone()))
+                .unwrap_or(ExprValue::Null),
+            "steps" if parts.len() == 3 && parts[2] == "outcome" => self
+                .step_statuses
+                .get(&parts[1])
+                .map(|(outcome, _)| ExprValue::String(outcome.clone()))
+                .unwrap_or(ExprValue::Null),
+            "steps" if parts.len() == 3 && parts[2] == "conclusion" => self
+                .step_statuses
+                .get(&parts[1])
+                .map(|(_, conclusion)| ExprValue::String(conclusion.clone()))
+                .unwrap_or(ExprValue::Null),
             _ => ExprValue::Null,
         }
     }
@@ -340,7 +402,12 @@ fn yaml_value_to_expr(v: &Value) -> ExprValue {
         Value::Number(n) => ExprValue::Number(n.as_f64().unwrap_or(0.0)),
         Value::Bool(b) => ExprValue::Bool(*b),
         Value::Null => ExprValue::Null,
-        _ => ExprValue::String(format!("{:?}", v)),
+        _ => ExprValue::String(
+            serde_yaml::to_string(v)
+                .unwrap_or_else(|_| format!("{:?}", v))
+                .trim()
+                .to_string(),
+        ),
     }
 }
 
@@ -520,7 +587,7 @@ impl Parser {
                 }
             }
             self.expect(&Token::RParen)?;
-            return call_builtin(&name, &args);
+            return call_builtin(&name, &args, ctx);
         }
 
         // Context reference: ident.ident.ident...
@@ -587,7 +654,11 @@ fn expr_cmp(a: &ExprValue, b: &ExprValue) -> Option<std::cmp::Ordering> {
 // Built-in functions
 // ---------------------------------------------------------------------------
 
-fn call_builtin(name: &str, args: &[ExprValue]) -> Result<ExprValue, String> {
+fn call_builtin(
+    name: &str,
+    args: &[ExprValue],
+    ctx: &ExpressionContext,
+) -> Result<ExprValue, String> {
     match name {
         "contains" => {
             if args.len() != 2 {
@@ -618,9 +689,31 @@ fn call_builtin(name: &str, args: &[ExprValue]) -> Result<ExprValue, String> {
                 return Err("format() requires at least 1 argument".to_string());
             }
             let fmt = args[0].to_output_string();
-            let mut result = fmt;
-            for (i, arg) in args.iter().skip(1).enumerate() {
-                result = result.replace(&format!("{{{}}}", i), &arg.to_output_string());
+            // Single-pass replacement to prevent arg content from being consumed
+            // by later placeholder substitutions (e.g. format('{0} {1}', '{1}', 'x')
+            // should produce '{1} x', not 'x x').
+            let mut result = String::with_capacity(fmt.len());
+            let mut chars = fmt.char_indices().peekable();
+            while let Some((i, ch)) = chars.next() {
+                if ch == '{' {
+                    // Look for {N} pattern
+                    let rest = &fmt[i + 1..];
+                    if let Some(close) = rest.find('}') {
+                        let inner = &rest[..close];
+                        if let Ok(idx) = inner.parse::<usize>() {
+                            if idx + 1 < args.len() {
+                                result.push_str(&args[idx + 1].to_output_string());
+                                // Skip past the closing '}'
+                                let skip_to = i + 1 + close + 1;
+                                while chars.peek().is_some_and(|(ci, _)| *ci < skip_to) {
+                                    chars.next();
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                result.push(ch);
             }
             Ok(ExprValue::String(result))
         }
@@ -643,7 +736,12 @@ fn call_builtin(name: &str, args: &[ExprValue]) -> Result<ExprValue, String> {
                 return Err("toJSON() requires 1 argument".to_string());
             }
             match &args[0] {
-                ExprValue::String(s) => Ok(ExprValue::String(format!("\"{}\"", s))),
+                ExprValue::String(s) => {
+                    // Use serde_json for robust escaping (handles control chars, null bytes, etc.)
+                    Ok(ExprValue::String(
+                        serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)),
+                    ))
+                }
                 ExprValue::Number(n) => Ok(ExprValue::String(format!("{}", n))),
                 ExprValue::Bool(b) => Ok(ExprValue::String(format!("{}", b))),
                 ExprValue::Null => Ok(ExprValue::String("null".to_string())),
@@ -663,18 +761,21 @@ fn call_builtin(name: &str, args: &[ExprValue]) -> Result<ExprValue, String> {
                     if let Ok(n) = s.parse::<f64>() {
                         Ok(ExprValue::Number(n))
                     } else {
-                        // Strip quotes if present
-                        let stripped = s.trim_matches('"');
+                        // Strip one layer of quotes if present
+                        let stripped = s
+                            .strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .unwrap_or(&s);
                         Ok(ExprValue::String(stripped.to_string()))
                     }
                 }
             }
         }
-        // Status functions — in local execution we assume success
-        "success" => Ok(ExprValue::Bool(true)),
-        "failure" => Ok(ExprValue::Bool(false)),
+        // Status functions — consult job_status from context
+        "success" => Ok(ExprValue::Bool(ctx.job_status == "success")),
+        "failure" => Ok(ExprValue::Bool(ctx.job_status == "failure")),
         "always" => Ok(ExprValue::Bool(true)),
-        "cancelled" => Ok(ExprValue::Bool(false)),
+        "cancelled" => Ok(ExprValue::Bool(ctx.job_status == "cancelled")),
         _ => {
             // Unknown function — return null rather than erroring
             Ok(ExprValue::Null)
@@ -732,36 +833,46 @@ pub fn evaluate_as_bool(expr: &str, ctx: &ExpressionContext) -> Result<bool, Str
 mod tests {
     use super::*;
 
+    lazy_static::lazy_static! {
+        static ref EMPTY_ENV: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_STEPS: HashMap<String, HashMap<String, String>> = HashMap::new();
+        static ref EMPTY_MATRIX: Option<HashMap<String, Value>> = None;
+        static ref EMPTY_STATUSES: HashMap<String, (String, String)> = HashMap::new();
+        static ref EMPTY_SECRETS: HashMap<String, String> = HashMap::new();
+        static ref EMPTY_NEEDS: HashMap<String, HashMap<String, String>> = HashMap::new();
+        static ref EMPTY_NEEDS_RESULTS: HashMap<String, String> = HashMap::new();
+    }
+
     fn empty_ctx() -> ExpressionContext<'static> {
-        // Leak to get 'static — fine for tests
-        let env: &'static HashMap<String, String> = Box::leak(Box::new(HashMap::new()));
-        let steps: &'static HashMap<String, HashMap<String, String>> =
-            Box::leak(Box::new(HashMap::new()));
-        let matrix: &'static Option<HashMap<String, Value>> = Box::leak(Box::new(None));
+        ExpressionContext {
+            env_context: &EMPTY_ENV,
+            step_outputs: &EMPTY_STEPS,
+            matrix_combination: &EMPTY_MATRIX,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
+        }
+    }
+
+    /// Build an `ExpressionContext` from the fields that vary across tests;
+    /// all other fields default to empty/success.
+    fn make_ctx<'a>(
+        env: &'a HashMap<String, String>,
+        steps: &'a HashMap<String, HashMap<String, String>>,
+        matrix: &'a Option<HashMap<String, Value>>,
+    ) -> ExpressionContext<'a> {
         ExpressionContext {
             env_context: env,
             step_outputs: steps,
             matrix_combination: matrix,
+            step_statuses: &EMPTY_STATUSES,
+            job_status: "success",
+            secrets_context: &EMPTY_SECRETS,
+            needs_context: &EMPTY_NEEDS,
+            needs_results: &EMPTY_NEEDS_RESULTS,
         }
-    }
-
-    fn ctx_with(
-        env: HashMap<String, String>,
-        steps: HashMap<String, HashMap<String, String>>,
-        matrix: Option<HashMap<String, Value>>,
-    ) -> (
-        ExpressionContext<'static>,
-        // Drop guards to prevent leaks in tests — not strictly needed since
-        // we're leaking anyway, but makes the pattern explicit
-    ) {
-        let env: &'static _ = Box::leak(Box::new(env));
-        let steps: &'static _ = Box::leak(Box::new(steps));
-        let matrix: &'static _ = Box::leak(Box::new(matrix));
-        (ExpressionContext {
-            env_context: env,
-            step_outputs: steps,
-            matrix_combination: matrix,
-        },)
     }
 
     // -- Literals --
@@ -938,7 +1049,8 @@ mod tests {
     fn eval_inputs_context() {
         let mut env = HashMap::new();
         env.insert("INPUT_TOOLCHAIN".to_string(), "nightly".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert_eq!(
             evaluate("inputs.toolchain", &ctx).unwrap(),
@@ -950,7 +1062,8 @@ mod tests {
     fn eval_env_context() {
         let mut env = HashMap::new();
         env.insert("MY_VAR".to_string(), "hello".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert_eq!(
             evaluate("env.MY_VAR", &ctx).unwrap(),
@@ -962,7 +1075,8 @@ mod tests {
     fn eval_github_context() {
         let mut env = HashMap::new();
         env.insert("GITHUB_REPOSITORY".to_string(), "owner/repo".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert_eq!(
             evaluate("github.repository", &ctx).unwrap(),
@@ -976,7 +1090,8 @@ mod tests {
         let mut build_out = HashMap::new();
         build_out.insert("version".to_string(), "1.2.3".to_string());
         steps.insert("build".to_string(), build_out);
-        let (ctx,) = ctx_with(HashMap::new(), steps, None);
+        let empty_env = HashMap::new();
+        let ctx = make_ctx(&empty_env, &steps, &None);
 
         assert_eq!(
             evaluate("steps.build.outputs.version", &ctx).unwrap(),
@@ -988,7 +1103,10 @@ mod tests {
     fn eval_matrix_context() {
         let mut matrix = HashMap::new();
         matrix.insert("os".to_string(), Value::String("ubuntu".to_string()));
-        let (ctx,) = ctx_with(HashMap::new(), HashMap::new(), Some(matrix));
+        let empty_env = HashMap::new();
+        let empty_steps = HashMap::new();
+        let matrix = Some(matrix);
+        let ctx = make_ctx(&empty_env, &empty_steps, &matrix);
 
         assert_eq!(
             evaluate("matrix.os", &ctx).unwrap(),
@@ -1018,7 +1136,7 @@ mod tests {
         parse_out.insert("toolchain".to_string(), "nightly".to_string());
         steps.insert("parse".to_string(), parse_out);
 
-        let (ctx,) = ctx_with(env, steps, None);
+        let ctx = make_ctx(&env, &steps, &None);
 
         let result = evaluate(
             "steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || ''",
@@ -1038,7 +1156,7 @@ mod tests {
         parse_out.insert("toolchain".to_string(), "stable".to_string());
         steps.insert("parse".to_string(), parse_out);
 
-        let (ctx,) = ctx_with(env, steps, None);
+        let ctx = make_ctx(&env, &steps, &None);
 
         let result = evaluate(
             "steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || ''",
@@ -1058,7 +1176,7 @@ mod tests {
         parse_out.insert("toolchain".to_string(), "nightly".to_string());
         steps.insert("parse".to_string(), parse_out);
 
-        let (ctx,) = ctx_with(env, steps, None);
+        let ctx = make_ctx(&env, &steps, &None);
 
         let result = evaluate(
             "steps.parse.outputs.toolchain == 'nightly' && inputs.components && ' --allow-downgrade' || ''",
@@ -1116,6 +1234,35 @@ mod tests {
     }
 
     #[test]
+    fn eval_format_non_ascii() {
+        let ctx = empty_ctx();
+        assert_eq!(
+            evaluate("format('{0} → {1}', 'a', 'b')", &ctx).unwrap(),
+            ExprValue::String("a → b".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_format_out_of_bounds_placeholder_preserved() {
+        let ctx = empty_ctx();
+        // {5} references a non-existent arg — should be left as literal "{5}"
+        assert_eq!(
+            evaluate("format('{0} {5}', 'hi')", &ctx).unwrap(),
+            ExprValue::String("hi {5}".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_format_arg_containing_placeholder_not_reinterpreted() {
+        let ctx = empty_ctx();
+        // format('{0} {1}', '{1}', 'x') should produce '{1} x', not 'x x'
+        assert_eq!(
+            evaluate("format('{0} {1}', '{1}', 'x')", &ctx).unwrap(),
+            ExprValue::String("{1} x".to_string())
+        );
+    }
+
+    #[test]
     fn eval_status_functions() {
         let ctx = empty_ctx();
         assert_eq!(evaluate("success()", &ctx).unwrap(), ExprValue::Bool(true));
@@ -1147,7 +1294,8 @@ mod tests {
     fn eval_as_bool_condition_with_context() {
         let mut env = HashMap::new();
         env.insert("GITHUB_REF".to_string(), "refs/tags/v1.0.0".to_string());
-        let (ctx,) = ctx_with(env, HashMap::new(), None);
+        let empty_steps = HashMap::new();
+        let ctx = make_ctx(&env, &empty_steps, &None);
 
         assert!(evaluate_as_bool("startsWith(github.ref, 'refs/tags/')", &ctx).unwrap());
     }
@@ -1181,5 +1329,47 @@ mod tests {
     fn eval_empty_expression() {
         let ctx = empty_ctx();
         assert_eq!(evaluate("", &ctx).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn unknown_step_id_returns_null() {
+        let ctx = empty_ctx();
+        assert_eq!(
+            evaluate("steps.nonexistent.outcome", &ctx).unwrap(),
+            ExprValue::Null
+        );
+        assert_eq!(
+            evaluate("steps.nonexistent.conclusion", &ctx).unwrap(),
+            ExprValue::Null
+        );
+    }
+
+    #[test]
+    fn tojson_escapes_control_characters() {
+        let ctx = empty_ctx();
+        // Tab, newline, carriage return
+        let result = evaluate("toJSON('line1\tindented\nline2\rend')", &ctx).unwrap();
+        let s = result.to_output_string();
+        assert!(s.contains("\\t"), "should escape tab: {}", s);
+        assert!(s.contains("\\n"), "should escape newline: {}", s);
+        assert!(s.contains("\\r"), "should escape carriage return: {}", s);
+    }
+
+    #[test]
+    fn tojson_escapes_quotes_and_backslash() {
+        let ctx = empty_ctx();
+        let result = evaluate(r#"toJSON('say "hello\world"')"#, &ctx).unwrap();
+        let s = result.to_output_string();
+        assert!(s.contains(r#"\""#), "should escape quotes: {}", s);
+        assert!(s.contains(r"\\"), "should escape backslash: {}", s);
+    }
+
+    #[test]
+    fn tojson_handles_null_bytes() {
+        let ctx = empty_ctx();
+        // Null byte in string — serde_json encodes as \u0000
+        let result = evaluate("toJSON('before\x00after')", &ctx).unwrap();
+        let s = result.to_output_string();
+        assert!(!s.contains('\0'), "should not contain raw null: {}", s);
     }
 }
