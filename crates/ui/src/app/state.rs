@@ -2,13 +2,15 @@
 use crate::log_processor::{LogProcessingRequest, LogProcessor, ProcessedLogEntry};
 use crate::models::{
     ExecutionResultMsg, JobExecution, LogFilterLevel, QueuedExecution, StatusSeverity,
-    StepExecution, Workflow, WorkflowExecution, WorkflowStatus,
+    StepExecution, TriggerMatchStatus, Workflow, WorkflowExecution, WorkflowStatus,
 };
 use chrono::Local;
 use crossterm::event::KeyCode;
 use ratatui::widgets::{ListState, TableState};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use wrkflw_executor::{JobStatus, RuntimeType, StepStatus};
 
 /// Application state
@@ -62,7 +64,89 @@ pub struct App {
     // Cached container runtime availability (avoids re-checking every render frame)
     pub runtime_available: bool,
     pub last_availability_check: Instant,
+
+    // Diff-aware trigger filtering
+    pub diff_filter_active: bool,
+    /// The event the TUI simulates for diff-filter evaluation. Stored on
+    /// `App` rather than as a hardcoded constant so a future event selector
+    /// UI is a data-flow change only.
+    pub diff_filter_event: String,
+    /// Activity type to stamp on the synthesized event context — same
+    /// purpose as `WatcherConfig::activity_type` and the CLI's
+    /// `--activity-type` flag. The TUI has no UI to set this yet, so it
+    /// defaults to `None`; the field exists so a future activity-type
+    /// selector is a plumbing-only change here, and so workflows that
+    /// gate on `pull_request: { types: [...] }` aren't silently rejected
+    /// the moment such a UI ships.
+    pub diff_filter_activity_type: Option<String>,
+    /// Channel receiving (workflow_path, trigger_status) pairs from the background
+    /// evaluation task. We send pairs (rather than a positional Vec) so that
+    /// reloading `self.workflows` between toggle and result delivery cannot
+    /// mis-assign trigger statuses.
+    pub diff_filter_rx: Option<DiffFilterReceiver>,
+    /// Handle for the most-recently-spawned evaluation task, held so
+    /// rapid toggles can cancel the previous in-flight evaluation instead
+    /// of leaking wasted git + parse work.
+    pub diff_filter_task: Option<JoinHandle<()>>,
+    /// Set to `true` immediately before we drop the previous evaluation's
+    /// receiver in [`App::toggle_diff_filter`]. The next
+    /// [`App::check_diff_filter_results`] tick uses it to distinguish a
+    /// self-inflicted disconnect (rapid toggle) from a genuine background
+    /// task failure, so we don't tell the user "evaluation failed" for an
+    /// action they took deliberately. Cleared once observed.
+    pub diff_filter_aborted: bool,
 }
+
+/// Result rows shipped from the background diff-filter task to the UI loop.
+pub type DiffFilterResults = Vec<(PathBuf, Option<TriggerMatchStatus>)>;
+
+/// Workflow files that failed to parse during a diff-filter evaluation,
+/// paired with the reason. Surfaced to the TUI log so the user is not
+/// left wondering why N workflows are missing from the result table.
+pub type DiffFilterParseFailures = Vec<(PathBuf, String)>;
+
+/// Successful diff-filter evaluation payload.
+///
+/// Carrying `parse_failures` alongside `rows` lets the UI distinguish
+/// "this workflow has triggers that did not match" from "this workflow
+/// has broken YAML and was silently dropped from the result map" — the
+/// previous `filter_map(... .ok())` collapsed both cases into the same
+/// `trigger_match = None` rendering, leaving users with no debugging
+/// signal when their `on:` block had a typo.
+///
+/// `warnings` carries the non-fatal diagnostics the trigger-filter
+/// collected while building the event context AND while parsing each
+/// workflow's `on:` block (e.g. `git ls-files --others` failed, so
+/// untracked files are missing from the change set; unknown event name
+/// typo in `on: pul_request`). The library routes these through struct
+/// fields on purpose — hosts own the rendering policy — so every host
+/// MUST drain them or reproduce the silent-skip failure mode the rest
+/// of this PR is built to plug. The CLI prefilter at
+/// `crates/wrkflw/src/main.rs` does this via `event_context.warnings`
+/// and `trigger_config.warnings`; the TUI plumbs both through this
+/// field so `check_diff_filter_results` can render them the same way
+/// `parse_failures` is rendered.
+#[derive(Debug, Clone)]
+pub struct DiffFilterReport {
+    pub rows: DiffFilterResults,
+    pub parse_failures: DiffFilterParseFailures,
+    pub warnings: Vec<String>,
+}
+
+/// Outcome of a background diff-filter evaluation.
+///
+/// Wrapping the row list in an enum lets us distinguish "we ran the
+/// evaluation and some workflows matched" from "we could not even build
+/// an event context" (e.g. git could not find a diff base), so the TUI
+/// can show the user a real error reason instead of silently reporting
+/// zero matches.
+#[derive(Debug, Clone)]
+pub enum DiffFilterOutcome {
+    Success(DiffFilterReport),
+    Failure(String),
+}
+
+pub type DiffFilterReceiver = mpsc::Receiver<DiffFilterOutcome>;
 
 impl App {
     pub fn new(
@@ -244,6 +328,13 @@ impl App {
 
             runtime_available,
             last_availability_check: Instant::now(),
+
+            diff_filter_active: false,
+            diff_filter_event: "push".to_string(),
+            diff_filter_activity_type: None,
+            diff_filter_rx: None,
+            diff_filter_task: None,
+            diff_filter_aborted: false,
         }
     }
 
@@ -272,6 +363,352 @@ impl App {
         self.last_availability_check = Instant::now();
         self.logs
             .push(format!("Switched to {} mode", self.runtime_type_name()));
+    }
+
+    /// Cycle through the event names the diff filter simulates.
+    ///
+    /// Previously `diff_filter_event` was dead-plumbing: it existed on
+    /// the struct, defaulted to "push", and was never mutated. The
+    /// review flagged this as a "TUI silently lies about which
+    /// workflows would run" hazard, because a user debugging a
+    /// `pull_request` workflow would see it reported as skipped even
+    /// when the filter would have matched on the right event.
+    ///
+    /// The rotation covers the event names that usually appear with
+    /// `branches:` / `paths:` filters. `workflow_dispatch` is included
+    /// because watch-mode users frequently want to model manual runs.
+    /// If an evaluation is already active we re-run it against the
+    /// new event so the result table updates immediately; if it is
+    /// inactive we just update the pending event name so the next
+    /// toggle uses it.
+    pub fn cycle_diff_filter_event(&mut self) {
+        const ROTATION: &[&str] = &[
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "workflow_dispatch",
+            "schedule",
+            "release",
+        ];
+        let current_idx = ROTATION
+            .iter()
+            .position(|name| *name == self.diff_filter_event)
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % ROTATION.len();
+        let next = ROTATION[next_idx].to_string();
+        self.logs.push(format!(
+            "Diff filter event: {} -> {}",
+            self.diff_filter_event, next
+        ));
+        self.diff_filter_event = next;
+        // If the filter is currently active, re-run evaluation so
+        // the result column reflects the new event immediately.
+        self.rerun_diff_filter_if_active();
+    }
+
+    /// Re-run an active diff-filter evaluation against the current
+    /// event/activity fields by tearing down the in-flight task and
+    /// spawning a fresh one.
+    ///
+    /// No-op when the filter is inactive. This is the path
+    /// [`Self::cycle_diff_filter_event`] takes after mutating
+    /// `diff_filter_event` so the result column reflects the new
+    /// event immediately.
+    ///
+    /// Previously this was a double `toggle_diff_filter` call, which
+    /// worked only as long as `toggle_diff_filter` stayed purely
+    /// idempotent in opposing directions — any future side effect
+    /// added to the toggle helper (metrics, tracing, throttle) would
+    /// have silently broken the rerun behaviour. Routing directly
+    /// through [`Self::spawn_evaluation`] makes the intent explicit
+    /// and removes the two-call fragility.
+    fn rerun_diff_filter_if_active(&mut self) {
+        if !self.diff_filter_active {
+            return;
+        }
+        self.spawn_evaluation();
+    }
+
+    /// Tear down any in-flight diff-filter evaluation.
+    ///
+    /// Aborts the background task handle (best-effort: `JoinHandle::abort`
+    /// only signals at the next await point, so a git future already in
+    /// flight may keep running until it completes) and drops the receiver
+    /// so any result the task eventually produces is discarded. Arms
+    /// [`App::diff_filter_aborted`] when there was actually something to
+    /// abort so the next [`App::check_diff_filter_results`] tick treats
+    /// the resulting `Disconnected` as self-inflicted instead of logging
+    /// "evaluation failed" for an action the user took deliberately.
+    ///
+    /// Intentionally does NOT touch `diff_filter_active` — callers own
+    /// the active-flag flip so the semantics of "toggle off" and
+    /// "restart evaluation" stay separable.
+    fn abort_in_flight_evaluation(&mut self) {
+        // Mark the disconnect as self-inflicted BEFORE dropping the
+        // receiver so the next tick's `check_diff_filter_results`
+        // distinguishes "we cancelled" from "the task crashed". Only
+        // arm the flag when there was actually something to abort,
+        // otherwise a fresh call from a clean state would silently
+        // suppress a real failure on the *next* evaluation.
+        if self.diff_filter_task.is_some() || self.diff_filter_rx.is_some() {
+            self.diff_filter_aborted = true;
+        }
+        if let Some(handle) = self.diff_filter_task.take() {
+            handle.abort();
+        }
+        self.diff_filter_rx = None;
+    }
+
+    /// Spawn a fresh diff-filter evaluation for the current workflow
+    /// list against the currently-selected `diff_filter_event` +
+    /// `diff_filter_activity_type`.
+    ///
+    /// Aborts any in-flight evaluation first so rapid toggles or
+    /// event-cycle key presses never leak wasted git + parse work.
+    /// Clears the stale `diff_filter_aborted` flag before spawning so
+    /// a genuine failure on the new task is surfaced to the user
+    /// instead of being mistaken for a self-inflicted abort.
+    ///
+    /// Git + parsing work is dispatched onto the ambient tokio runtime
+    /// via `tokio::task::spawn`. Results are received via
+    /// [`Self::check_diff_filter_results`] on the next tick.
+    fn spawn_evaluation(&mut self) {
+        self.abort_in_flight_evaluation();
+
+        // A new evaluation begins with a fresh receiver. Any
+        // `diff_filter_aborted` flag still set at this point belongs
+        // to a *prior* abort cycle whose receiver was dropped without
+        // ever being observed (e.g. user toggled OFF, no tick ran,
+        // user toggled back ON). Leaving it armed here would silently
+        // swallow a genuine failure on the new task — exactly the
+        // silent-skip mode this PR is built to prevent. Clear it
+        // before spawning so the next `Disconnected` is treated as
+        // a real failure and surfaced to the user.
+        self.diff_filter_aborted = false;
+
+        let event_name = self.diff_filter_event.clone();
+        let activity_type = self.diff_filter_activity_type.clone();
+        self.add_log(format!(
+            "Diff filter: evaluating triggers (simulating '{}' event)...",
+            event_name
+        ));
+
+        let workflow_paths: Vec<PathBuf> = self.workflows.iter().map(|w| w.path.clone()).collect();
+
+        let (tx, rx) = mpsc::channel();
+        self.diff_filter_rx = Some(rx);
+
+        // Anchor git operations at the discovered repo root rather
+        // than the process CWD. The TUI may be launched from a
+        // sibling repo or a subdirectory; without this, every git
+        // helper inside `auto_detect_context_default_base` would
+        // run wherever the user happened to be when they started
+        // `wrkflw tui`. The watcher and CLI prefilter both anchor
+        // at the repo root for the same reason.
+        //
+        // `find_repo_root_detailed` shells out to `git rev-parse
+        // --show-toplevel` synchronously. Calling it on the UI
+        // thread would hitch the TUI on every toggle on a network
+        // mount, so we move it onto the blocking pool inside the
+        // spawned task. Using the classified `_detailed` form
+        // (instead of the old `Option` wrapper) lets us surface a
+        // "not in a git repository" / "git not installed" /
+        // "timed out" reason to the user instead of silently
+        // collapsing every failure into "0/N would trigger".
+        let handle = tokio::task::spawn(async move {
+            let repo_root_result =
+                tokio::task::spawn_blocking(wrkflw_trigger_filter::find_repo_root_detailed).await;
+            let repo_root = match repo_root_result {
+                Ok(Ok(p)) => Some(p),
+                // `NotInRepository` is a legitimate soft state —
+                // the user may have launched `wrkflw tui` from
+                // /tmp or a non-repo sandbox, and the downstream
+                // git helpers will surface a clearer message
+                // (e.g. "not a git repository" from `git diff`)
+                // which lands in the Failure outcome below.
+                Ok(Err(wrkflw_trigger_filter::FindRepoRootError::NotInRepository)) => None,
+                Ok(Err(e)) => {
+                    let _ = tx.send(DiffFilterOutcome::Failure(e.to_string()));
+                    return;
+                }
+                Err(join_err) => {
+                    let _ = tx.send(DiffFilterOutcome::Failure(format!(
+                        "find_repo_root task panicked: {}",
+                        join_err
+                    )));
+                    return;
+                }
+            };
+            let results =
+                evaluate_diff_filter(workflow_paths, event_name, activity_type, repo_root).await;
+            let _ = tx.send(results);
+        });
+        self.diff_filter_task = Some(handle);
+    }
+
+    /// Toggle diff-aware trigger filtering and evaluate all workflows.
+    ///
+    /// On ON→OFF: aborts any in-flight task, drops the receiver,
+    /// clears the per-workflow trigger match state, and logs
+    /// "Diff filter OFF".
+    ///
+    /// On OFF→ON: delegates to [`Self::spawn_evaluation`], which
+    /// dispatches git + parsing onto the ambient tokio runtime.
+    /// Results are received via [`Self::check_diff_filter_results`]
+    /// on the next tick.
+    ///
+    /// If an evaluation is already in flight (rapid toggle), the
+    /// previous task's [`JoinHandle`] is aborted and its `mpsc::Sender`
+    /// is dropped. `JoinHandle::abort` only signals at the next await
+    /// point — git futures already in flight may keep running until
+    /// they complete — but the receiver is gone, so any results they
+    /// produce are discarded. From the user's perspective the
+    /// previous evaluation is dead; in reality it's "no longer
+    /// observed."
+    pub fn toggle_diff_filter(&mut self) {
+        self.diff_filter_active = !self.diff_filter_active;
+
+        if self.diff_filter_active {
+            self.spawn_evaluation();
+        } else {
+            self.abort_in_flight_evaluation();
+            for workflow in &mut self.workflows {
+                workflow.trigger_match = None;
+            }
+            self.logs.push("Diff filter OFF".to_string());
+        }
+    }
+
+    /// Check for completed diff filter results from the background task.
+    /// Called on each TUI tick to apply results without blocking.
+    ///
+    /// Results are looked up by workflow path so that reloading
+    /// `self.workflows` between toggle and result delivery (e.g. a new file
+    /// shows up on disk) does not cause statuses to be assigned to the wrong
+    /// workflow.
+    ///
+    /// A channel payload of [`DiffFilterOutcome::Failure`] surfaces the
+    /// underlying error reason to the TUI log instead of silently leaving
+    /// every workflow as `None` — previously the user would see
+    /// "0/N workflows would trigger" with no explanation.
+    pub fn check_diff_filter_results(&mut self) {
+        let results = match self.diff_filter_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(results) => results,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.diff_filter_rx = None;
+                    self.diff_filter_task = None;
+                    // A `Disconnected` here can mean two things:
+                    //   1. The background task panicked or returned without
+                    //      sending — a real failure the user should see.
+                    //   2. We deliberately aborted the previous evaluation
+                    //      because the user toggled rapidly. The receiver
+                    //      we are draining is the *abandoned* one and the
+                    //      next tick will see a fresh channel.
+                    // Use the `diff_filter_aborted` flag (set in
+                    // `toggle_diff_filter`) to distinguish them. Self-
+                    // inflicted aborts are silent; everything else is a
+                    // real failure and stays loud.
+                    if self.diff_filter_aborted {
+                        self.diff_filter_aborted = false;
+                    } else {
+                        self.logs.push("Diff filter: evaluation failed".to_string());
+                    }
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.diff_filter_rx = None;
+        self.diff_filter_task = None;
+        // We received a real payload, so any pending "we aborted" flag
+        // belonged to a previous cycle whose disconnect we never observed
+        // (because the new task beat it to the channel). Clear it so the
+        // next genuine failure isn't silently swallowed.
+        self.diff_filter_aborted = false;
+
+        match results {
+            DiffFilterOutcome::Success(DiffFilterReport {
+                rows,
+                parse_failures,
+                warnings,
+            }) => {
+                let by_path: std::collections::HashMap<PathBuf, Option<TriggerMatchStatus>> =
+                    rows.into_iter().collect();
+                for workflow in self.workflows.iter_mut() {
+                    workflow.trigger_match = by_path.get(&workflow.path).cloned().flatten();
+                }
+
+                let matched = self
+                    .workflows
+                    .iter()
+                    .filter(|w| matches!(&w.trigger_match, Some(TriggerMatchStatus::Matched(_))))
+                    .count();
+                self.logs.push(format!(
+                    "Diff filter ON: {}/{} workflows would trigger",
+                    matched,
+                    self.workflows.len()
+                ));
+
+                // Surface non-fatal warnings from the library BEFORE
+                // the parse-failure block so the most actionable
+                // diagnostics land closest to the "N/M triggered"
+                // summary line. `warnings` carries both context-level
+                // (e.g. `git ls-files --others` failed — untracked
+                // files missing from the change set) and parser-level
+                // (e.g. unknown event name typo) diagnostics. Previously
+                // the TUI dropped all of these on the floor even
+                // though the library deliberately routed them through
+                // `EventContext::warnings` / `WorkflowTriggerConfig::warnings`
+                // for hosts to render — the CLI prefilter logs them
+                // at `crates/wrkflw/src/main.rs`; parity is
+                // load-bearing to avoid the silent-skip mode this PR
+                // is built to plug.
+                if !warnings.is_empty() {
+                    self.logs
+                        .push(format!("Diff filter: {} warning(s)", warnings.len()));
+                    for w in &warnings {
+                        self.logs.push(format!("  warning: {}", w));
+                    }
+                }
+
+                // Parse failures used to be silently dropped via
+                // `filter_map(... .ok())`, leaving the user with N
+                // workflows showing as `-` (untriggered) and no clue why.
+                // Surface each failure individually so the YAML/glob
+                // typo is the first thing they see in the log pane.
+                if !parse_failures.is_empty() {
+                    self.logs.push(format!(
+                        "Diff filter: {} workflow file(s) failed to parse and were skipped",
+                        parse_failures.len()
+                    ));
+                    for (path, reason) in &parse_failures {
+                        self.logs
+                            .push(format!("  parse error: {}: {}", path.display(), reason));
+                    }
+                }
+
+                // Ad-hoc `self.logs.push(...)` skips the cap that
+                // `add_log` / `mark_logs_for_update` normally enforce.
+                // A single large evaluation could push dozens of
+                // rows + warnings + parse failures all at once, and
+                // without this trim the buffer can temporarily exceed
+                // `LOG_BUFFER_CAP` until the next render pass happens
+                // to route through `mark_logs_for_update`. Mirror the
+                // `add_log` discipline here so the cap invariant is
+                // reasserted immediately.
+                self.trim_logs_to_cap();
+            }
+            DiffFilterOutcome::Failure(reason) => {
+                for workflow in &mut self.workflows {
+                    workflow.trigger_match = None;
+                }
+                self.logs
+                    .push(format!("Diff filter: evaluation failed — {}", reason));
+                self.trim_logs_to_cap();
+            }
+        }
     }
 
     pub fn toggle_validation_mode(&mut self) {
@@ -1168,8 +1605,17 @@ impl App {
         }
     }
 
-    /// Trigger log processing when search/filter changes
+    /// Trigger log processing when search/filter changes.
+    ///
+    /// Also enforces the log buffer cap so ad-hoc `self.logs.push(...)`
+    /// sites — which are sprinkled throughout the codebase for
+    /// historical reasons — don't need to each remember to call
+    /// [`trim_logs_to_cap`]. Every log mutation eventually routes
+    /// through `mark_logs_for_update` (that's what makes the logs
+    /// actually render), so trimming here is the single
+    /// unavoidable choke point.
     pub fn mark_logs_for_update(&mut self) {
+        self.trim_logs_to_cap();
         self.logs_need_update = true;
         self.request_log_processing_update();
     }
@@ -1194,6 +1640,7 @@ impl App {
     /// Add a log entry and trigger log processing update
     pub fn add_log(&mut self, message: String) {
         self.logs.push(message);
+        self.trim_logs_to_cap();
         self.mark_logs_for_update();
     }
 
@@ -1203,6 +1650,212 @@ impl App {
         let formatted_message = format!("[{}] {}", timestamp, message);
         self.add_log(formatted_message);
     }
+
+    /// Upper bound on the TUI's in-memory log buffer. A long-lived TUI
+    /// session (especially with rapid diff-filter toggles, each of
+    /// which appends 2+ entries) previously grew unbounded — the
+    /// review flagged this as a slow-leak hazard.
+    ///
+    /// **Why 5000?** Sized against the two dominant log sources:
+    ///
+    ///   - The executor emits roughly 1-3 lines per workflow step
+    ///     (status + stdout/stderr header). A typical session running
+    ///     a handful of workflows with ~10 steps each stays well below
+    ///     1000 lines per run.
+    ///   - Diff-filter toggles and watch-style re-evaluations emit
+    ///     2-5 lines per cycle (summary + matched/skipped breakdown +
+    ///     optional warnings). Even at a frenzied toggle-per-second
+    ///     pace this produces ~300 lines/minute.
+    ///
+    /// 5000 lines therefore holds ~15 minutes of aggressive toggling
+    /// or several full multi-workflow runs of scrollback — enough for
+    /// a user to debug the most recent failure without bloating RSS
+    /// by the multi-megabyte String heap that an unbounded buffer
+    /// eventually produces in a day-long session. Below ~1000 the
+    /// cap starts losing context mid-run; above ~20000 the heap
+    /// footprint becomes visible on slow machines. If a future TUI
+    /// gains a "save full transcript" feature, route it to a file
+    /// sink rather than holding the transcript in this in-memory
+    /// buffer — the cap should stay in the 5000 neighbourhood
+    /// regardless of scrollback-export needs.
+    const LOG_BUFFER_CAP: usize = 5000;
+
+    /// Enforce [`LOG_BUFFER_CAP`] by dropping the oldest entries
+    /// until the buffer is within bounds. Called from every
+    /// [`add_log`] path AND from [`trim_logs_to_cap`] so ad-hoc
+    /// `self.logs.push(...)` sites can opt into the cap by calling
+    /// this once after pushing.
+    ///
+    /// Uses `drain(0..N)` instead of rebuilding the vec so the tail
+    /// entries don't get re-cloned; the operation is O(n) in the
+    /// number of *dropped* entries, which is zero on the fast path.
+    pub fn trim_logs_to_cap(&mut self) {
+        if self.logs.len() > Self::LOG_BUFFER_CAP {
+            let excess = self.logs.len() - Self::LOG_BUFFER_CAP;
+            self.logs.drain(0..excess);
+        }
+    }
+}
+
+/// Run git + trigger evaluation as an async task on the ambient runtime.
+///
+/// Returns a [`DiffFilterOutcome`] so the UI can distinguish "evaluation
+/// ran and produced rows" from "no event context could be built" — the
+/// latter is typically a missing-default-branch or missing-commits error
+/// that the user needs a real explanation for.
+///
+/// The event name is passed through from the caller rather than hardcoded,
+/// so a future TUI change that adds event selection is a plumbing-only
+/// change here.
+async fn evaluate_diff_filter(
+    workflow_paths: Vec<PathBuf>,
+    event_name: String,
+    activity_type: Option<String>,
+    repo_root: Option<PathBuf>,
+) -> DiffFilterOutcome {
+    // Nothing to evaluate — bail out before paying for the git subprocess
+    // calls. Without this, toggling the diff filter on an empty workflow
+    // list would still shell out to `git rev-parse`/`git diff`/`git
+    // describe` and just throw the result away. Mirrors the watcher's
+    // `configs.is_empty()` short-circuit in `evaluate_and_execute`.
+    if workflow_paths.is_empty() {
+        return DiffFilterOutcome::Success(DiffFilterReport {
+            rows: Vec::new(),
+            parse_failures: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+
+    // Pass the discovered repo root through to every git helper so the
+    // diff/branch/tag queries run against the user's actual repo, not
+    // whatever the process CWD happens to be. `None` is still tolerated
+    // (e.g. user launched the TUI outside any repo) — the helpers will
+    // surface a `GitError` and the TUI will log it.
+    let cwd: Option<&Path> = repo_root.as_deref();
+    // The TUI is a hot-path host: the user may toggle the diff filter
+    // many times during a session, and the dirty-tree info message
+    // that `get_default_diff_base` emits would flood the log pane
+    // every toggle. Pass `verbose = false` so the CLI's loud message
+    // stays quiet here; users who need the explanation run `wrkflw
+    // run --diff --verbose` on the command line.
+    let mut context = match wrkflw_trigger_filter::auto_detect_context_default_base(
+        &event_name,
+        cwd,
+        false,
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            return DiffFilterOutcome::Failure(format!("{}", e));
+        }
+    };
+    // Stamp the activity type so workflows that filter on
+    // `pull_request: { types: [...] }` can match. Mirrors the
+    // CLI prefilter and the watcher; without it the TUI silently
+    // rejects every typed pull_request workflow.
+    context.activity_type = activity_type;
+
+    // Drain the context-level warnings into our own accumulator
+    // BEFORE we hand the context to `filter_trigger_configs`. The
+    // library routes these through `EventContext::warnings` instead
+    // of calling `wrkflw_logging::warning` directly on purpose —
+    // hosts own the rendering policy — so every host MUST consume
+    // them or reproduce the silent-skip failure mode the rest of
+    // this PR is built to plug. The CLI prefilter does this at
+    // `crates/wrkflw/src/main.rs`; parity is load-bearing.
+    //
+    // `MustDrainWarnings::take()` leaves an empty buffer in its
+    // place so the downstream `filter_trigger_configs` call still
+    // sees a well-formed context without any of the cost of a
+    // clone. `take` (not read-only iteration) is also what
+    // satisfies the `MustDrainWarnings` Drop-check contract — if we
+    // borrowed instead, the context's Drop would fire the
+    // "dropped without being drained" eprintln in debug builds.
+    let mut warnings: Vec<String> = context.warnings.take();
+
+    // Trigger config parsing is synchronous file I/O; run it on a
+    // blocking thread so we don't hold the reactor while reading every
+    // .yml in the repo. `load_trigger_configs` consolidates read + parse
+    // and partitions the result into successes + per-file failures, so
+    // the TUI and the watcher fail identically on the same broken file
+    // and the failure branch is never silently dropped.
+    let paths_for_parse = workflow_paths.clone();
+    // Route through the shared LRU so toggling the TUI diff filter
+    // repeatedly on the same workflows pays the parse cost exactly
+    // once per (path, mtime). The CLI prefilter and the watcher hit
+    // the same cache — unifying the three entry points was a review
+    // ask specifically to prevent future drift.
+    let tf_config = wrkflw_trigger_filter::TriggerFilterConfig::default();
+    let parse_outcome: Result<
+        (
+            Vec<wrkflw_trigger_filter::WorkflowTriggerConfig>,
+            DiffFilterParseFailures,
+        ),
+        _,
+    > = tokio::task::spawn_blocking(move || {
+        wrkflw_trigger_filter::load_trigger_configs_cached(&paths_for_parse, &tf_config)
+    })
+    .await;
+
+    let (mut configs, parse_failures) = match parse_outcome {
+        Ok(pair) => pair,
+        Err(e) => {
+            return DiffFilterOutcome::Failure(format!("background task failed: {}", e));
+        }
+    };
+
+    // Harvest per-workflow parser warnings (unknown event names, etc.)
+    // the same way the CLI prefilter at `crates/wrkflw/src/main.rs`
+    // does. `parse_trigger_config` stores typo-detection diagnostics
+    // on `WorkflowTriggerConfig::warnings` instead of logging them,
+    // so each successfully-parsed config may still carry a warning.
+    // Prefixing with the workflow path lets the log pane point the
+    // user at exactly which file has the problem.
+    //
+    // `.take()` (not read-only iteration) is load-bearing: it is
+    // what satisfies the `MustDrainWarnings` Drop-check contract.
+    // A borrow-only `for w in &cfg.warnings` would leave the
+    // buffer non-empty on `cfg` drop, and the debug-build Drop
+    // impl would fire the "dropped without being drained"
+    // eprintln. Keeping this draining form also prevents the
+    // silent-skip regression the Drop check was designed to catch.
+    for cfg in configs.iter_mut() {
+        let path_display = cfg.workflow_path.display().to_string();
+        for w in cfg.warnings.take() {
+            warnings.push(format!("{}: {}", path_display, w));
+        }
+    }
+
+    let borrowed: Vec<&wrkflw_trigger_filter::WorkflowTriggerConfig> = configs.iter().collect();
+    let results = wrkflw_trigger_filter::filter_trigger_configs(&borrowed, &context);
+    let results_by_path: std::collections::HashMap<
+        PathBuf,
+        &wrkflw_trigger_filter::TriggerMatchResult,
+    > = results
+        .iter()
+        .map(|r| (r.workflow_path.clone(), r))
+        .collect();
+
+    let rows = workflow_paths
+        .into_iter()
+        .map(|path| {
+            let status = results_by_path.get(&path).map(|result| {
+                if result.matches {
+                    TriggerMatchStatus::Matched(result.reason.clone())
+                } else {
+                    TriggerMatchStatus::Skipped(result.reason.clone())
+                }
+            });
+            (path, status)
+        })
+        .collect();
+
+    DiffFilterOutcome::Success(DiffFilterReport {
+        rows,
+        parse_failures,
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -1221,6 +1874,7 @@ mod tests {
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
                 job_names: vec!["build".to_string(), "lint".to_string(), "test".to_string()],
+                trigger_match: None,
             },
             Workflow {
                 name: "deploy".to_string(),
@@ -1229,10 +1883,61 @@ mod tests {
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
                 job_names: vec![],
+                trigger_match: None,
             },
         ];
         app.workflow_list_state.select(Some(0));
         app
+    }
+
+    #[test]
+    fn log_buffer_caps_at_configured_size() {
+        // Long-running TUI sessions (especially with rapid diff-filter
+        // toggles) previously grew `logs` unbounded. The cap has to
+        // hold even when callers push directly to `self.logs` without
+        // going through `add_log`, because every render path eventually
+        // routes through `mark_logs_for_update`. Verify the cap kicks
+        // in on both shapes.
+        let mut app = make_app();
+        // Start from a clean slate so the setup-time log lines do not
+        // pollute the size assertion.
+        app.logs.clear();
+        for i in 0..(App::LOG_BUFFER_CAP + 200) {
+            app.logs.push(format!("line {}", i));
+        }
+        app.mark_logs_for_update();
+        assert_eq!(
+            app.logs.len(),
+            App::LOG_BUFFER_CAP,
+            "log buffer must be capped even for direct pushes routed through mark_logs_for_update"
+        );
+        // The tail must be the most recent entries, not the oldest.
+        assert!(
+            app.logs
+                .last()
+                .unwrap()
+                .contains(&format!("{}", App::LOG_BUFFER_CAP + 199)),
+            "newest entry must survive the drain, got {:?}",
+            app.logs.last()
+        );
+    }
+
+    #[test]
+    fn cycle_diff_filter_event_rotates_through_known_events() {
+        let mut app = make_app();
+        assert_eq!(app.diff_filter_event, "push");
+        app.cycle_diff_filter_event();
+        assert_eq!(app.diff_filter_event, "pull_request");
+        app.cycle_diff_filter_event();
+        assert_eq!(app.diff_filter_event, "pull_request_target");
+        // Six-step rotation wraps back to push.
+        for _ in 0..4 {
+            app.cycle_diff_filter_event();
+        }
+        assert_eq!(
+            app.diff_filter_event, "push",
+            "rotation must wrap after exhausting the known-event list"
+        );
     }
 
     #[test]
@@ -1301,6 +2006,367 @@ mod tests {
         assert_eq!(app.selected_job_index, 0);
         app.previous_available_job();
         assert_eq!(app.selected_job_index, 0);
+    }
+
+    #[test]
+    fn check_diff_filter_results_keys_by_path_not_position() {
+        // Regression: previously the result was zipped positionally with
+        // self.workflows. If the workflow list reloaded between toggle and
+        // result delivery, statuses would land on the wrong workflow.
+        let mut app = make_app();
+        // Simulate a reload that reorders workflows AFTER we captured paths
+        app.workflows = vec![
+            Workflow {
+                name: "deploy".into(),
+                path: PathBuf::from("deploy.yml"),
+                selected: false,
+                status: WorkflowStatus::NotStarted,
+                execution_details: None,
+                job_names: vec![],
+                trigger_match: None,
+            },
+            Workflow {
+                name: "ci".into(),
+                path: PathBuf::from("ci.yml"),
+                selected: false,
+                status: WorkflowStatus::NotStarted,
+                execution_details: None,
+                job_names: vec![],
+                trigger_match: None,
+            },
+        ];
+
+        // Background thread reports results keyed to the OLD order
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![
+                (
+                    PathBuf::from("ci.yml"),
+                    Some(TriggerMatchStatus::Matched("matched ci".into())),
+                ),
+                (
+                    PathBuf::from("deploy.yml"),
+                    Some(TriggerMatchStatus::Skipped("skipped deploy".into())),
+                ),
+            ],
+            parse_failures: Vec::new(),
+            warnings: Vec::new(),
+        }))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        // After applying, ci.yml must be Matched and deploy.yml Skipped
+        // regardless of their position in self.workflows.
+        let by_name: std::collections::HashMap<&str, &Option<TriggerMatchStatus>> = app
+            .workflows
+            .iter()
+            .map(|w| (w.name.as_str(), &w.trigger_match))
+            .collect();
+        assert!(matches!(
+            by_name.get("ci").unwrap(),
+            Some(TriggerMatchStatus::Matched(_))
+        ));
+        assert!(matches!(
+            by_name.get("deploy").unwrap(),
+            Some(TriggerMatchStatus::Skipped(_))
+        ));
+    }
+
+    #[test]
+    fn check_diff_filter_results_surfaces_parse_failures_to_logs() {
+        // Regression: previously, workflows whose YAML failed to parse
+        // were silently dropped via `.filter_map(... .ok())`. The user
+        // saw `0/N would trigger`, the workflow row stayed at `-`, and
+        // there was no signal that the YAML was broken. After the fix,
+        // each parse failure must appear in the log pane with its
+        // path + error reason.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![(
+                PathBuf::from("ci.yml"),
+                Some(TriggerMatchStatus::Matched("matched ci".into())),
+            )],
+            parse_failures: vec![(
+                PathBuf::from("broken.yml"),
+                "Invalid glob pattern '[unclosed' under 'push.paths'".to_string(),
+            )],
+            warnings: Vec::new(),
+        }))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs.iter().any(|l| l.contains("failed to parse")),
+            "expected parse-failure summary line in logs, got {:?}",
+            new_logs
+        );
+        assert!(
+            new_logs
+                .iter()
+                .any(|l| l.contains("broken.yml") && l.contains("[unclosed")),
+            "expected per-file parse error line in logs, got {:?}",
+            new_logs
+        );
+    }
+
+    #[test]
+    fn check_diff_filter_results_surfaces_context_and_parser_warnings_to_logs() {
+        // Regression: previously the TUI dropped every
+        // `EventContext::warnings` and every `WorkflowTriggerConfig::warnings`
+        // on the floor, even though the library deliberately routes
+        // those through struct fields so hosts own the rendering
+        // policy. The CLI prefilter at `crates/wrkflw/src/main.rs`
+        // logs both sources via `wrkflw_logging::warning`; the TUI must
+        // produce matching output in its log pane or reproduce the
+        // silent-skip failure mode the rest of this PR was built to
+        // plug (e.g. a `git ls-files --others` failure silently drops
+        // untracked files from the change set; an `on: pul_request`
+        // typo never surfaces; every workflow shows `-` with no clue).
+        //
+        // This test covers TWO warning sources in one payload:
+        //   1. A context-level warning (think: `git ls-files --others`
+        //      safe-directory rejection).
+        //   2. A parser-level warning already prefixed with the
+        //      workflow path, the same shape `evaluate_diff_filter`
+        //      produces when it harvests `WorkflowTriggerConfig::warnings`.
+        // Both must show up in the log burst, and the summary count
+        // line must match the number of warnings delivered.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Success(DiffFilterReport {
+            rows: vec![(
+                PathBuf::from("ci.yml"),
+                Some(TriggerMatchStatus::Matched("matched ci".into())),
+            )],
+            parse_failures: Vec::new(),
+            warnings: vec![
+                "git ls-files --others failed (exit 128): fatal: unsafe repository".to_string(),
+                ".github/workflows/ci.yml: workflow test.yml uses unknown event 'pul_request'"
+                    .to_string(),
+            ],
+        }))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs
+                .iter()
+                .any(|l| l.contains("Diff filter: 2 warning(s)")),
+            "expected warning-count summary line in logs, got {:?}",
+            new_logs
+        );
+        assert!(
+            new_logs
+                .iter()
+                .any(|l| l.contains("git ls-files --others failed")),
+            "context warning must surface in logs, got {:?}",
+            new_logs
+        );
+        assert!(
+            new_logs.iter().any(|l| l.contains("pul_request")),
+            "parser warning (unknown event typo) must surface in logs, got {:?}",
+            new_logs
+        );
+    }
+
+    #[test]
+    fn check_diff_filter_results_surfaces_failure_reason_to_logs() {
+        // Regression: previously, if auto_detect_context_default_base
+        // errored (e.g. fresh repo with no remote default branch), the
+        // TUI silently showed every workflow as None and the summary
+        // line said "0/N workflows would trigger" with no explanation.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        let (tx, rx) = mpsc::channel();
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_active = true;
+        tx.send(DiffFilterOutcome::Failure(
+            "could not detect a diff base".into(),
+        ))
+        .unwrap();
+
+        app.check_diff_filter_results();
+
+        // The failure reason should be visible in the log, not silently dropped.
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs.iter().any(|l| l.contains("could not detect")),
+            "expected failure reason in logs, got {:?}",
+            new_logs
+        );
+        // All workflows must have trigger_match cleared on failure.
+        for wf in &app.workflows {
+            assert!(wf.trigger_match.is_none());
+        }
+    }
+
+    #[test]
+    fn check_diff_filter_results_silences_self_inflicted_disconnect() {
+        // Regression: previously, dropping the receiver (e.g. via a rapid
+        // toggle that aborted the in-flight task) reached the
+        // `Disconnected` arm and logged "evaluation failed" — misleading,
+        // because the user took the action themselves. After the fix, a
+        // disconnect that follows an `aborted` flag must be silent, and
+        // the flag must be cleared so the *next* genuine failure is still
+        // surfaced loudly.
+        let mut app = make_app();
+        let log_count_before = app.logs.len();
+
+        // Build a channel and immediately drop the sender to simulate an
+        // aborted background task: the next try_recv will see Disconnected.
+        let (tx, rx) = mpsc::channel::<DiffFilterOutcome>();
+        drop(tx);
+        app.diff_filter_rx = Some(rx);
+        app.diff_filter_aborted = true;
+
+        app.check_diff_filter_results();
+
+        // No "evaluation failed" line should have been added.
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            !new_logs.iter().any(|l| l.contains("evaluation failed")),
+            "self-inflicted abort must not log a failure, got {:?}",
+            new_logs
+        );
+        // Flag must be consumed so the next disconnect is loud again.
+        assert!(
+            !app.diff_filter_aborted,
+            "abort flag must be cleared after being observed"
+        );
+
+        // Now simulate a real failure (no abort flag set) on a fresh
+        // disconnect — it should produce a log line.
+        let log_count_after_silent = app.logs.len();
+        let (tx2, rx2) = mpsc::channel::<DiffFilterOutcome>();
+        drop(tx2);
+        app.diff_filter_rx = Some(rx2);
+        // Note: aborted flag is intentionally NOT set this time.
+
+        app.check_diff_filter_results();
+
+        let final_logs: Vec<&String> = app.logs.iter().skip(log_count_after_silent).collect();
+        assert!(
+            final_logs.iter().any(|l| l.contains("evaluation failed")),
+            "genuine disconnect must still be reported, got {:?}",
+            final_logs
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_diff_filter_arms_abort_flag_only_when_task_in_flight() {
+        // Toggling from a clean state (no in-flight task) must NOT arm
+        // the abort flag — otherwise the *next* evaluation's genuine
+        // failure would be silently swallowed.
+        //
+        // This test runs under `#[tokio::test]` because the active branch
+        // of `toggle_diff_filter` calls `tokio::task::spawn`, which panics
+        // without an ambient runtime. We don't await the spawned task
+        // (the git/parse work would actually try to shell out); we only
+        // assert the synchronous flag-arming behavior that runs before
+        // the spawn returns.
+        let mut app = make_app();
+        assert!(app.diff_filter_task.is_none());
+        assert!(app.diff_filter_rx.is_none());
+
+        app.toggle_diff_filter();
+        // After a fresh toggle ON, the abort flag must remain false:
+        // there was nothing to abort, so the next disconnect is real.
+        assert!(
+            !app.diff_filter_aborted,
+            "fresh toggle must not arm the abort flag"
+        );
+
+        // Toggling again — this time there IS an in-flight task and
+        // receiver — must arm the flag so the resulting Disconnected
+        // tick is treated as self-inflicted.
+        app.toggle_diff_filter();
+        assert!(
+            app.diff_filter_aborted,
+            "toggle with task in flight must arm the abort flag"
+        );
+
+        // Cancel the spawned task so the test doesn't leak it.
+        if let Some(handle) = app.diff_filter_task.take() {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_flag_does_not_silence_failures_across_toggle_cycles() {
+        // Regression for the stale-abort-flag bug: when the user toggles
+        // OFF (which arms the flag and drops the receiver) and the next
+        // tick observes `rx is None` and returns early, the flag is left
+        // armed. The *next* toggle ON spawns a fresh task with a fresh
+        // receiver, and a real failure on that fresh task used to be
+        // silenced because the leftover flag was treated as a self-
+        // inflicted abort. After the fix, starting a new evaluation
+        // must clear any stale flag so a genuine failure is loud.
+        let mut app = make_app();
+
+        // Step 1: Toggle ON — spawns task A.
+        app.toggle_diff_filter();
+        assert!(app.diff_filter_task.is_some(), "task A should be in flight");
+        assert!(!app.diff_filter_aborted);
+
+        // Step 2: Toggle OFF — aborts A, arms flag, drops rx.
+        app.toggle_diff_filter();
+        assert!(app.diff_filter_aborted, "OFF with in-flight task arms flag");
+        assert!(app.diff_filter_rx.is_none());
+
+        // Step 3: A tick fires while OFF. With rx=None it returns early
+        // and never observes/clears the flag — this is the gap that the
+        // old code left behind.
+        app.check_diff_filter_results();
+        assert!(
+            app.diff_filter_aborted,
+            "early-return tick must not touch the flag"
+        );
+
+        // Step 4: Toggle ON again. The fix is here: starting a new
+        // evaluation must clear the stale flag so the next failure is
+        // not mistaken for a self-inflicted abort.
+        app.toggle_diff_filter();
+        assert!(
+            !app.diff_filter_aborted,
+            "stale abort flag from a prior cycle must be cleared on new evaluation"
+        );
+
+        // Step 5: Cancel the real spawned task and inject a fresh
+        // already-disconnected channel to simulate task B failing
+        // (panic, send-side dropped). The flag is currently false, so
+        // the disconnect must be reported as a genuine failure.
+        if let Some(handle) = app.diff_filter_task.take() {
+            handle.abort();
+        }
+        let (tx, rx) = mpsc::channel::<DiffFilterOutcome>();
+        drop(tx);
+        app.diff_filter_rx = Some(rx);
+
+        let log_count_before = app.logs.len();
+        app.check_diff_filter_results();
+        let new_logs: Vec<&String> = app.logs.iter().skip(log_count_before).collect();
+        assert!(
+            new_logs.iter().any(|l| l.contains("evaluation failed")),
+            "real failure on a fresh evaluation must surface, got {:?}",
+            new_logs
+        );
     }
 
     #[test]

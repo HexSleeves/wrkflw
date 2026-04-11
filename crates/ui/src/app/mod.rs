@@ -78,6 +78,7 @@ pub async fn run_wrkflw_tui(
                 status: WorkflowStatus::NotStarted,
                 execution_details: None,
                 job_names,
+                trigger_match: None,
             }];
 
             // Queue the single workflow for execution
@@ -179,6 +180,9 @@ fn run_tui_event_loop(
             if app.logs_need_update {
                 app.request_log_processing_update();
             }
+
+            // Check for completed diff filter results
+            app.check_diff_filter_results();
 
             last_tick = Instant::now();
         }
@@ -392,6 +396,24 @@ fn run_tui_event_loop(
                     KeyCode::Char('v') => {
                         if !app.running {
                             app.toggle_validation_mode();
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if !app.running && app.selected_tab == 0 {
+                            app.toggle_diff_filter();
+                        }
+                    }
+                    KeyCode::Char('D') => {
+                        // Shift+D cycles through the diff-filter event
+                        // name (push → pull_request → workflow_dispatch →
+                        // schedule → release → push). Previously the
+                        // event name was a hardcoded "push" and the TUI
+                        // silently reported "0 triggered" for any
+                        // workflow gated on a non-push event — exactly
+                        // the "stop lying about which workflows would
+                        // run" failure mode the commit history fought.
+                        if !app.running && app.selected_tab == 0 {
+                            app.cycle_diff_filter_event();
                         }
                     }
                     KeyCode::Char('n') => {
