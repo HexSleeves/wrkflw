@@ -105,11 +105,17 @@ async fn execute_github_workflow(
 
     // 4. Set up GitHub-like environment
     let mut env_context = environment::create_github_context(&workflow, workspace_dir.path());
+    // Track the user-declared slice of env separately so `toJSON(env)` only
+    // dumps what the user actually wrote in YAML (and later, what steps write
+    // to `$GITHUB_ENV`). Starts empty — `create_github_context` only seeds
+    // runner-internal vars.
+    let mut user_env: HashMap<String, String> = HashMap::new();
 
     // Add workflow-level environment variables (lowest precedence — does not override
     // built-in GITHUB_*/RUNNER_* vars; job and step env override these later).
     // Resolve ${{ }} expressions (e.g. ${{ github.repository }}) in values.
     {
+        // At this point workflow.env hasn't been merged yet — user_env is empty.
         let wf_expr_ctx = crate::expression::ExpressionContext {
             env_context: &env_context,
             step_outputs: &HashMap::new(),
@@ -119,6 +125,7 @@ async fn execute_github_workflow(
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            user_env: &user_env,
         };
         let cwd = std::env::current_dir().map_err(|e| {
             ExecutionError::Execution(format!("Failed to get current directory: {}", e))
@@ -134,7 +141,14 @@ async fn execute_github_workflow(
             })
             .collect();
         for (key, value) in resolved_env {
-            env_context.entry(key).or_insert(value);
+            // `or_insert` semantics: workflow.env does not override runner-seeded
+            // vars. user_env mirrors the same precedence — a workflow.env key that
+            // collides with a runner var is dropped from env_context AND not added
+            // to user_env (real GHA doesn't let workflow.env shadow runner vars).
+            env_context.entry(key.clone()).or_insert_with(|| {
+                user_env.insert(key, value.clone());
+                value
+            });
         }
     }
 
@@ -210,6 +224,7 @@ async fn execute_github_workflow(
             &workflow,
             runtime.as_ref(),
             &env_context,
+            &user_env,
             config.verbose,
             secret_manager.as_ref(),
             Some(&secret_masker),
@@ -390,6 +405,9 @@ async fn execute_gitlab_pipeline(
             &workflow,
             runtime.as_ref(),
             &env_context,
+            // GitLab pipelines don't carry workflow-level `env:`, so user_env
+            // starts empty; it'll accumulate through job/step env merges.
+            &HashMap::new(),
             config.verbose,
             secret_manager.as_ref(),
             Some(&secret_masker),
@@ -1697,6 +1715,7 @@ async fn execute_job_batch(
     workflow: &WorkflowDefinition,
     runtime: &dyn ContainerRuntime,
     env_context: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
     verbose: bool,
     secret_manager: Option<&SecretManager>,
     secret_masker: Option<&SecretMasker>,
@@ -1712,6 +1731,7 @@ async fn execute_job_batch(
             workflow,
             runtime,
             env_context,
+            user_env,
             verbose,
             secret_manager,
             secret_masker,
@@ -1746,6 +1766,9 @@ struct JobExecutionContext<'a> {
     workflow: &'a WorkflowDefinition,
     runtime: &'a dyn ContainerRuntime,
     env_context: &'a HashMap<String, String>,
+    /// Workflow-level user-declared env only (runner-seeded vars excluded).
+    /// Consumed by `toJSON(env)` downstream. See `ExpressionContext::user_env`.
+    user_env: &'a HashMap<String, String>,
     verbose: bool,
     services: JobServices<'a>,
 }
@@ -1757,6 +1780,7 @@ async fn execute_job_with_matrix(
     workflow: &WorkflowDefinition,
     runtime: &dyn ContainerRuntime,
     env_context: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
     verbose: bool,
     secret_manager: Option<&SecretManager>,
     secret_masker: Option<&SecretMasker>,
@@ -1775,7 +1799,7 @@ async fn execute_job_with_matrix(
 
     // Evaluate job condition if present
     if let Some(if_condition) = &job.if_condition {
-        let should_run = evaluate_job_condition(if_condition, env_context, workflow);
+        let should_run = evaluate_job_condition(if_condition, env_context, user_env, workflow);
         if !should_run {
             wrkflw_logging::info(&format!(
                 "{} Skipping job '{}' due to condition: {}",
@@ -1852,6 +1876,7 @@ async fn execute_job_with_matrix(
             workflow,
             runtime,
             env_context,
+            user_env,
             verbose,
             services,
         })
@@ -1872,6 +1897,7 @@ async fn execute_job_with_matrix(
             workflow,
             runtime,
             env_context,
+            user_env,
             verbose,
             services,
         };
@@ -1893,23 +1919,32 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             .await;
     }
 
-    // Clone context and add job-specific variables
+    // Clone context and add job-specific variables.
+    // `job_env` is the full lookup map (runner + user union); `job_user_env`
+    // mirrors only the user-declared slice for `toJSON(env)`.
     let mut job_env = ctx.env_context.clone();
+    let mut job_user_env = ctx.user_env.clone();
 
-    // Add container-level environment variables (lowest precedence)
+    // Add container-level environment variables (lowest precedence).
+    // Container env is user-declared (jobs.<id>.container.env in YAML) — mirror
+    // into job_user_env. Skip keys already present (`.entry().or_insert`).
     if let Some(ref container) = job.container {
         warn_unsupported_container_fields(container);
         for (key, value) in &container.env {
-            job_env.entry(key.clone()).or_insert_with(|| value.clone());
+            if !job_env.contains_key(key) {
+                job_env.insert(key.clone(), value.clone());
+                job_user_env.insert(key.clone(), value.clone());
+            }
         }
     }
 
-    // Add job-level environment variables (overrides container env)
+    // Add job-level environment variables (overrides container env).
     for (key, value) in &job.env {
         job_env.insert(key.clone(), value.clone());
+        job_user_env.insert(key.clone(), value.clone());
     }
 
-    // Add job-specific context
+    // Add job-specific context (runner-internal — GITHUB_JOB; not user env)
     environment::add_job_context(&mut job_env, ctx.job_name);
 
     // Create a temporary directory for this job execution
@@ -1952,6 +1987,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
                     step,
                     step_idx: idx,
                     job_env: &job_env,
+                    job_user_env: &job_user_env,
                     working_dir: job_dir.path(),
                     runtime: ctx.runtime,
                     workflow: ctx.workflow,
@@ -1997,6 +2033,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
             step,
             ctx.verbose,
             &mut job_env,
+            &mut job_user_env,
             ctx.services.secret_masker,
         ) {
             job_success = false;
@@ -2015,6 +2052,7 @@ async fn execute_job(ctx: JobExecutionContext<'_>) -> Result<JobResult, Executio
         &loop_state.step_outputs_map,
         &loop_state.step_status_map,
         &job_env,
+        &job_user_env,
         &loop_state.job_status_str,
         &current_dir,
     );
@@ -2043,6 +2081,8 @@ struct MatrixExecutionContext<'a> {
     workflow: &'a WorkflowDefinition,
     runtime: &'a dyn ContainerRuntime,
     env_context: &'a HashMap<String, String>,
+    /// Workflow-level user-declared env, threaded in from `JobExecutionContext`.
+    user_env: &'a HashMap<String, String>,
     verbose: bool,
     services: JobServices<'a>,
 }
@@ -2083,6 +2123,7 @@ async fn execute_matrix_combinations(
                 ctx.workflow,
                 ctx.runtime,
                 ctx.env_context,
+                ctx.user_env,
                 ctx.verbose,
                 &ctx.services,
             )
@@ -2124,6 +2165,7 @@ async fn execute_matrix_job(
     workflow: &WorkflowDefinition,
     runtime: &dyn ContainerRuntime,
     base_env_context: &HashMap<String, String>,
+    base_user_env: &HashMap<String, String>,
     verbose: bool,
     services: &JobServices<'_>,
 ) -> Result<JobResult, ExecutionError> {
@@ -2132,15 +2174,22 @@ async fn execute_matrix_job(
 
     wrkflw_logging::info(&format!("Executing matrix job: {}", matrix_job_name));
 
-    // Clone the environment and add matrix-specific values
+    // Clone the environment and add matrix-specific values.
+    // `job_env` is the full lookup map; `job_user_env` mirrors the user slice.
+    // Matrix-derived `MATRIX_*` vars and `MATRIX_CONTEXT` are runner-internal —
+    // they belong in job_env only, not user_env (they surface via `toJSON(matrix)`).
     let mut job_env = base_env_context.clone();
+    let mut job_user_env = base_user_env.clone();
     environment::add_matrix_context(&mut job_env, combination);
 
-    // Add container-level environment variables (lowest precedence)
+    // Add container-level environment variables (lowest precedence). User-declared.
     if let Some(ref container) = job_template.container {
         warn_unsupported_container_fields(container);
         for (key, value) in &container.env {
-            job_env.entry(key.clone()).or_insert_with(|| value.clone());
+            if !job_env.contains_key(key) {
+                job_env.insert(key.clone(), value.clone());
+                job_user_env.insert(key.clone(), value.clone());
+            }
         }
     }
 
@@ -2159,6 +2208,7 @@ async fn execute_matrix_job(
             secrets_context: services.secrets_context,
             needs_context: services.needs_context,
             needs_results: services.needs_results,
+            user_env: &job_user_env,
         };
         let cwd = std::env::current_dir().map_err(|e| {
             ExecutionError::Execution(format!("Failed to get current directory: {}", e))
@@ -2174,7 +2224,8 @@ async fn execute_matrix_job(
             })
             .collect();
         for (key, value) in resolved_env {
-            job_env.insert(key, value);
+            job_env.insert(key.clone(), value.clone());
+            job_user_env.insert(key, value);
         }
     }
 
@@ -2216,6 +2267,7 @@ async fn execute_matrix_job(
                         step,
                         step_idx: idx,
                         job_env: &job_env,
+                        job_user_env: &job_user_env,
                         working_dir: job_dir.path(),
                         runtime,
                         workflow,
@@ -2261,6 +2313,7 @@ async fn execute_matrix_job(
                 step,
                 verbose,
                 &mut job_env,
+                &mut job_user_env,
                 services.secret_masker,
             ) {
                 all_steps_ok = false;
@@ -2282,6 +2335,7 @@ async fn execute_matrix_job(
         &loop_state.step_outputs_map,
         &loop_state.step_status_map,
         &job_env,
+        &job_user_env,
         &loop_state.job_status_str,
         &current_dir,
     );
@@ -2403,6 +2457,7 @@ impl StepLoopState {
         step: &workflow::Step,
         verbose: bool,
         job_env: &mut HashMap<String, String>,
+        job_user_env: &mut HashMap<String, String>,
         secret_masker: Option<&SecretMasker>,
     ) -> bool {
         match outcome {
@@ -2447,6 +2502,7 @@ impl StepLoopState {
 
                 crate::github_env_files::apply_step_environment_updates(
                     job_env,
+                    job_user_env,
                     &mut self.step_outputs_map,
                     step.id.as_deref(),
                 );
@@ -2671,6 +2727,10 @@ struct StepExecutionContext<'a> {
     step: &'a workflow::Step,
     step_idx: usize,
     job_env: &'a HashMap<String, String>,
+    /// Job-level user-declared env (workflow.env ∪ container.env ∪ job.env, plus
+    /// any `$GITHUB_ENV` writes from prior steps). Excludes runner-seeded vars.
+    /// Consumed by `toJSON(env)` via `ExpressionContext::user_env`.
+    job_user_env: &'a HashMap<String, String>,
     working_dir: &'a Path,
     runtime: &'a dyn ContainerRuntime,
     workflow: &'a WorkflowDefinition,
@@ -2701,13 +2761,17 @@ impl<'a> StepExecutionContext<'a> {
             secrets_context: self.services.secrets_context,
             needs_context: self.services.needs_context,
             needs_results: self.services.needs_results,
+            user_env: self.job_user_env,
         }
     }
 
-    /// Build an `ExpressionContext` using a custom env (e.g. partially-built step env).
+    /// Build an `ExpressionContext` using a custom env + matching user_env
+    /// (e.g. partially-built step env). Both must cover the same merge layer —
+    /// `env` is env_context (runner + user union), `user_env` is the user slice.
     fn expr_context_with_env<'e>(
         &self,
         env: &'e HashMap<String, String>,
+        user_env: &'e HashMap<String, String>,
     ) -> crate::expression::ExpressionContext<'e>
     where
         'a: 'e,
@@ -2721,6 +2785,7 @@ impl<'a> StepExecutionContext<'a> {
             secrets_context: self.services.secrets_context,
             needs_context: self.services.needs_context,
             needs_results: self.services.needs_results,
+            user_env,
         }
     }
 }
@@ -3017,8 +3082,11 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
         wrkflw_logging::info(&format!("  Executing step: {}", step_name));
     }
 
-    // Prepare step environment
+    // Prepare step environment. `step_env` is the merged lookup map (runner +
+    // user); `step_user_env` mirrors only the user-declared slice and is what
+    // `toJSON(env)` sees.
     let mut step_env = ctx.job_env.clone();
+    let mut step_user_env = ctx.job_user_env.clone();
 
     // Add step-level environment variables (with secret + expression substitution)
     for (key, value) in &ctx.step.env {
@@ -3038,7 +3106,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             value.clone()
         };
         // Resolve ${{ }} expressions in env values (e.g. ${{inputs.toolchain}})
-        let env_expr_ctx = ctx.expr_context_with_env(&step_env);
+        let env_expr_ctx = ctx.expr_context_with_env(&step_env, &step_user_env);
         let resolved_value = match crate::substitution::preprocess_expressions(
             &resolved_value,
             ctx.working_dir,
@@ -3047,7 +3115,8 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
             Ok(r) => r,
             Err(_) => resolved_value,
         };
-        step_env.insert(key.clone(), resolved_value);
+        step_env.insert(key.clone(), resolved_value.clone());
+        step_user_env.insert(key.clone(), resolved_value);
     }
 
     // Execute the step based on its type
@@ -3116,6 +3185,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.step,
                             action_path,
                             &step_env,
+                            &step_user_env,
                             ctx.working_dir,
                             ctx.runtime,
                             ctx.runner_image,
@@ -3171,6 +3241,7 @@ async fn execute_step(ctx: StepExecutionContext<'_>) -> Result<StepResult, Execu
                             ctx.step,
                             &action_dir,
                             &step_env,
+                            &step_user_env,
                             ctx.working_dir,
                             ctx.runtime,
                             ctx.runner_image,
@@ -4363,12 +4434,18 @@ async fn run_called_workflow(
     let mut any_failed = false;
     let mut reusable_job_outputs: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut reusable_job_results: HashMap<String, String> = HashMap::new();
+    // Reusable workflows have their own scope — parent workflow.env doesn't
+    // flow in, and the called workflow's own workflow.env isn't currently
+    // being merged into child_env (pre-existing gap). Pass an empty user_env
+    // for now; job-level env merges still populate it correctly downstream.
+    let child_user_env: HashMap<String, String> = HashMap::new();
     for batch in plan {
         let results = execute_job_batch(
             &batch,
             called,
             ctx.runtime,
             &child_env,
+            &child_user_env,
             ctx.verbose,
             ctx.services.secret_manager,
             ctx.services.secret_masker,
@@ -4513,6 +4590,7 @@ async fn execute_composite_action(
     step: &workflow::Step,
     action_path: &Path,
     job_env: &HashMap<String, String>,
+    job_user_env: &HashMap<String, String>,
     working_dir: &Path,
     runtime: &dyn ContainerRuntime,
     runner_image: &str,
@@ -4555,8 +4633,12 @@ async fn execute_composite_action(
                 }
             };
 
-            // Process inputs from the calling step's 'with' parameters
+            // Process inputs from the calling step's 'with' parameters.
+            // `action_env` is the full lookup map; `action_user_env` mirrors
+            // the user-declared slice. INPUT_* vars are runner-internal — they
+            // go into action_env only, not action_user_env.
             let mut action_env = job_env.clone();
+            let mut action_user_env = job_user_env.clone();
             if let Some(inputs_def) = action_def.get("inputs") {
                 if let Some(inputs_map) = inputs_def.as_mapping() {
                     for (input_name, input_def) in inputs_map {
@@ -4609,6 +4691,7 @@ async fn execute_composite_action(
                     step: &composite_step,
                     step_idx: idx,
                     job_env: &action_env,
+                    job_user_env: &action_user_env,
                     working_dir,
                     runtime,
                     workflow: &workflow::WorkflowDefinition {
@@ -4662,9 +4745,12 @@ async fn execute_composite_action(
 
                 // Read back GITHUB_OUTPUT/GITHUB_ENV/GITHUB_PATH so subsequent
                 // composite steps can reference ${{ steps.<id>.outputs.<key> }}
-                // and see environment changes from prior steps.
+                // and see environment changes from prior steps. $GITHUB_ENV
+                // writes mirror into action_user_env so composite toJSON(env)
+                // sees them.
                 crate::github_env_files::apply_step_environment_updates(
                     &mut action_env,
+                    &mut action_user_env,
                     &mut composite_step_outputs,
                     composite_step.id.as_deref(),
                 );
@@ -4676,6 +4762,7 @@ async fn execute_composite_action(
                         &action_def,
                         &composite_step_outputs,
                         &action_env,
+                        &action_user_env,
                         job_env,
                         working_dir,
                         &composite_job_status,
@@ -4695,6 +4782,7 @@ async fn execute_composite_action(
                 &action_def,
                 &composite_step_outputs,
                 &action_env,
+                &action_user_env,
                 job_env,
                 working_dir,
                 &composite_job_status,
@@ -4758,6 +4846,7 @@ fn propagate_composite_outputs(
     action_def: &serde_yaml::Value,
     composite_step_outputs: &HashMap<String, HashMap<String, String>>,
     action_env: &HashMap<String, String>,
+    action_user_env: &HashMap<String, String>,
     caller_job_env: &HashMap<String, String>,
     working_dir: &Path,
     job_status: &str,
@@ -4782,6 +4871,7 @@ fn propagate_composite_outputs(
         secrets_context: &empty_secrets,
         needs_context: &empty_needs,
         needs_results: &empty_results,
+        user_env: action_user_env,
     };
 
     // Collect evaluated outputs
@@ -4963,6 +5053,7 @@ fn convert_yaml_to_step(step_yaml: &serde_yaml::Value) -> Result<workflow::Step,
 fn evaluate_job_condition(
     condition: &str,
     env_context: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
     _workflow: &WorkflowDefinition,
 ) -> bool {
     let ctx = crate::expression::ExpressionContext {
@@ -4974,6 +5065,7 @@ fn evaluate_job_condition(
         secrets_context: &HashMap::new(),
         needs_context: &HashMap::new(),
         needs_results: &HashMap::new(),
+        user_env,
     };
     evaluate_condition_with_context(condition, &ctx)
 }
@@ -5041,6 +5133,7 @@ fn resolve_job_outputs(
     step_outputs_map: &HashMap<String, HashMap<String, String>>,
     step_status_map: &HashMap<String, (String, String)>,
     env_context: &HashMap<String, String>,
+    user_env: &HashMap<String, String>,
     job_status: &str,
     working_dir: &Path,
 ) -> HashMap<String, String> {
@@ -5055,6 +5148,7 @@ fn resolve_job_outputs(
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            user_env,
         };
         for (key, expr) in outputs {
             match crate::substitution::preprocess_expressions(expr, working_dir, &ctx) {
@@ -5593,6 +5687,7 @@ mod tests {
         // Workflow-level env values containing ${{ }} expressions should be resolved
         let env_context: HashMap<String, String> =
             HashMap::from([("GITHUB_REPOSITORY".into(), "owner/repo".into())]);
+        let empty_user_env = HashMap::new();
         let expr_ctx = crate::expression::ExpressionContext {
             env_context: &env_context,
             step_outputs: &HashMap::new(),
@@ -5602,6 +5697,7 @@ mod tests {
             secrets_context: &HashMap::new(),
             needs_context: &HashMap::new(),
             needs_results: &HashMap::new(),
+            user_env: &empty_user_env,
         };
         let cwd = std::env::current_dir().unwrap();
 
@@ -5630,8 +5726,8 @@ mod tests {
     fn condition_true_false_literals() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        assert!(evaluate_job_condition("true", &env, &wf));
-        assert!(!evaluate_job_condition("false", &env, &wf));
+        assert!(evaluate_job_condition("true", &env, &env, &wf));
+        assert!(!evaluate_job_condition("false", &env, &env, &wf));
     }
 
     #[test]
@@ -5643,10 +5739,12 @@ mod tests {
         assert!(!evaluate_job_condition(
             "steps.build.outcome == 'success'",
             &env,
+            &env,
             &wf
         ));
         assert!(!evaluate_job_condition(
             "steps.build.outcome == 'failure'",
+            &env,
             &env,
             &wf
         ));
@@ -5656,28 +5754,28 @@ mod tests {
     fn condition_success_function_defaults_true() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        assert!(evaluate_job_condition("success()", &env, &wf));
+        assert!(evaluate_job_condition("success()", &env, &env, &wf));
     }
 
     #[test]
     fn condition_failure_function_defaults_false() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        assert!(!evaluate_job_condition("failure()", &env, &wf));
+        assert!(!evaluate_job_condition("failure()", &env, &env, &wf));
     }
 
     #[test]
     fn condition_always_function_defaults_true() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        assert!(evaluate_job_condition("always()", &env, &wf));
+        assert!(evaluate_job_condition("always()", &env, &env, &wf));
     }
 
     #[test]
     fn condition_cancelled_function_defaults_false() {
         let env = HashMap::new();
         let wf = empty_workflow();
-        assert!(!evaluate_job_condition("cancelled()", &env, &wf));
+        assert!(!evaluate_job_condition("cancelled()", &env, &env, &wf));
     }
 
     #[test]
@@ -5685,7 +5783,12 @@ mod tests {
         let env = HashMap::new();
         let wf = empty_workflow();
         // success() is present, so compound expression should default to true
-        assert!(evaluate_job_condition("failure() || success()", &env, &wf));
+        assert!(evaluate_job_condition(
+            "failure() || success()",
+            &env,
+            &env,
+            &wf
+        ));
     }
 
     #[test]
@@ -5695,6 +5798,7 @@ mod tests {
         // Only negative functions, no positive counterpart → false
         assert!(!evaluate_job_condition(
             "failure() || cancelled()",
+            &env,
             &env,
             &wf
         ));
@@ -5706,11 +5810,21 @@ mod tests {
         let wf = empty_workflow();
         // always() → true, failure() → false, true && false → false
         // The expression evaluator correctly evaluates the compound expression
-        assert!(!evaluate_job_condition("always() && failure()", &env, &wf));
+        assert!(!evaluate_job_condition(
+            "always() && failure()",
+            &env,
+            &env,
+            &wf
+        ));
         // always() alone → true
-        assert!(evaluate_job_condition("always()", &env, &wf));
+        assert!(evaluate_job_condition("always()", &env, &env, &wf));
         // always() || failure() → true (|| returns first truthy)
-        assert!(evaluate_job_condition("always() || failure()", &env, &wf));
+        assert!(evaluate_job_condition(
+            "always() || failure()",
+            &env,
+            &env,
+            &wf
+        ));
     }
 
     #[test]
@@ -5719,9 +5833,14 @@ mod tests {
         let wf = empty_workflow();
         // Malformed conditions should evaluate to false (not true) — matching
         // GitHub Actions behavior where unparseable expressions error out.
-        assert!(!evaluate_job_condition("&&& invalid syntax", &env, &wf));
-        assert!(!evaluate_job_condition("== broken", &env, &wf));
-        assert!(!evaluate_job_condition("((( unmatched", &env, &wf));
+        assert!(!evaluate_job_condition(
+            "&&& invalid syntax",
+            &env,
+            &env,
+            &wf
+        ));
+        assert!(!evaluate_job_condition("== broken", &env, &env, &wf));
+        assert!(!evaluate_job_condition("((( unmatched", &env, &env, &wf));
     }
 
     #[test]
@@ -5734,15 +5853,22 @@ mod tests {
         assert!(evaluate_job_condition(
             "env.MY_STEPS_COUNT == '5'",
             &env,
+            &env,
             &wf
         ));
         assert!(evaluate_job_condition(
             "env._STEPS_CHECK == 'ok'",
             &env,
+            &env,
             &wf
         ));
         // Missing env var → null, null != '5' → false
-        assert!(!evaluate_job_condition("env.MISSING_VAR == '5'", &env, &wf));
+        assert!(!evaluate_job_condition(
+            "env.MISSING_VAR == '5'",
+            &env,
+            &env,
+            &wf
+        ));
     }
 
     // --- volume path traversal tests ---
@@ -6200,6 +6326,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -6251,6 +6378,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -6307,6 +6435,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -6356,6 +6485,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -6406,6 +6536,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -6455,6 +6586,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -6502,6 +6634,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7041,6 +7174,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7088,6 +7222,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7131,6 +7266,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7166,6 +7302,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7203,6 +7340,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7251,6 +7389,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7297,6 +7436,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7343,6 +7483,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7387,6 +7528,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: &working_dir,
             runtime: &runtime,
             workflow: &workflow,
@@ -7612,6 +7754,7 @@ runs:
             &step_outputs,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             "success",
             Path::new("."),
         );
@@ -7632,6 +7775,7 @@ runs:
 
         let result = resolve_job_outputs(
             &job,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -7720,6 +7864,7 @@ runs:
             &step_outputs,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             "success",
             Path::new("."),
         );
@@ -7734,6 +7879,7 @@ runs:
 
         let resolved = resolve_job_outputs(
             &job,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -7758,6 +7904,7 @@ runs:
 
         let resolved = resolve_job_outputs(
             &job,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -7802,6 +7949,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -7848,6 +7996,7 @@ runs:
             step: &dl_step,
             step_idx: 1,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: dl_workspace.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -7923,6 +8072,7 @@ runs:
             step: &run_step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -7968,6 +8118,7 @@ runs:
             step: &up_step,
             step_idx: 1,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8019,6 +8170,7 @@ runs:
             step: &dl_step,
             step_idx: 2,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: dl_workspace.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8087,6 +8239,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8154,6 +8307,7 @@ runs:
             secrets_context: &empty_secrets,
             needs_context: &needs_ctx,
             needs_results: &needs_res,
+            user_env: &empty_env,
         };
 
         // Test needs.build.outputs.artifact
@@ -8208,6 +8362,7 @@ runs:
             secrets_context: &empty_secrets,
             needs_context: &empty_needs,
             needs_results: &empty_needs_results,
+            user_env: &empty_env,
         };
 
         // outcome should be "failure" (raw result)
@@ -8249,6 +8404,7 @@ runs:
             secrets_context: &secrets,
             needs_context: &empty_needs,
             needs_results: &empty_needs_results,
+            user_env: &empty_env,
         };
 
         let result = crate::expression::evaluate("secrets.API_KEY", &ctx).unwrap();
@@ -8290,6 +8446,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8360,6 +8517,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: dl_workspace.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8415,6 +8573,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8467,6 +8626,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8525,6 +8685,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8669,6 +8830,7 @@ runs:
             step: &step,
             step_idx: 0,
             job_env: &job_env,
+            job_user_env: &job_env,
             working_dir: working_dir.path(),
             runtime: &runtime,
             workflow: &workflow,
@@ -8762,6 +8924,7 @@ runs:
             &action_def,
             &composite_step_outputs,
             &action_env,
+            &action_env,
             &caller_env,
             &working_dir,
             "success",
@@ -8800,6 +8963,7 @@ runs:
         propagate_composite_outputs(
             &action_def,
             &composite_step_outputs,
+            &action_env,
             &action_env,
             &caller_env,
             &working_dir,
@@ -8846,6 +9010,7 @@ runs:
         propagate_composite_outputs(
             &action_def,
             &composite_step_outputs,
+            &action_env,
             &action_env,
             &caller_env,
             &working_dir,
@@ -8896,6 +9061,7 @@ runs:
         propagate_composite_outputs(
             &action_def,
             &composite_step_outputs,
+            &action_env,
             &action_env,
             &caller_env,
             &working_dir,
@@ -8949,6 +9115,7 @@ runs:
         propagate_composite_outputs(
             &action_def,
             &composite_step_outputs,
+            &action_env,
             &action_env,
             &caller_env,
             &working_dir,
@@ -9022,6 +9189,7 @@ runs:
         propagate_composite_outputs(
             &action_def,
             &composite_step_outputs,
+            &action_env,
             &action_env,
             &caller_env,
             &working_dir,
