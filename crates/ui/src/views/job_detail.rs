@@ -125,7 +125,7 @@ fn render_tab_strip(f: &mut Frame<'_>, active: usize, area: Rect) {
             format!(" {} ", label),
             if is_active {
                 Style::default()
-                    .fg(COLORS.accent)
+                    .fg(theme::current_accent())
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
                 Style::default().fg(COLORS.text_dim)
@@ -380,7 +380,10 @@ fn render_matrix_pane(
             None => vec![format!("{:?}", value)],
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}: ", name), Style::default().fg(COLORS.accent)),
+            Span::styled(
+                format!("  {}: ", name),
+                Style::default().fg(theme::current_accent()),
+            ),
             Span::styled(values.join(", "), Style::default().fg(COLORS.text)),
         ]));
     }
@@ -401,16 +404,94 @@ fn render_matrix_pane(
         lines.push(Line::from(""));
         lines.push(Line::from(chips));
     }
-    if !matrix.include.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            format!("INCLUDE ({})", matrix.include.len()),
-            Style::default()
-                .fg(COLORS.highlight)
-                .add_modifier(Modifier::BOLD),
-        )]));
+
+    // Matrix combinations — real expansion via `wrkflw_matrix::expand_matrix`.
+    //
+    // We can show the combos (the *what* — design screen 5's grid) but
+    // not per-combo runtime status (the *how it went* — we don't track
+    // status per combo, only aggregated job status). So rows are
+    // labelled `queued` by default; if the parent job finished we
+    // inherit its status for every row. This is honest: a future
+    // executor change to surface per-combo results will drop right
+    // into this render.
+    match wrkflw_matrix::expand_matrix(matrix) {
+        Ok(combos) if !combos.is_empty() => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                format!("COMBINATIONS ({})", combos.len()),
+                Style::default()
+                    .fg(COLORS.highlight)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            // Key order: show axes in the order they were declared,
+            // plus any extra keys an `include:` entry introduced,
+            // appended after (and sorted, since `MatrixCombination.values`
+            // is a HashMap whose iteration order is not stable — without
+            // a sort, include-only columns could jitter between frames
+            // or process runs).
+            let mut key_order: Vec<String> = matrix.parameters.keys().cloned().collect();
+            let mut extra: Vec<String> = Vec::new();
+            for c in &combos {
+                for k in c.values.keys() {
+                    if !key_order.contains(k) && !extra.contains(k) {
+                        extra.push(k.clone());
+                    }
+                }
+            }
+            extra.sort();
+            key_order.extend(extra);
+            for c in combos.iter().take(32) {
+                let mut spans: Vec<Span> = vec![Span::raw("  ")];
+                let status_glyph = inherited_combo_glyph(workflow, job_name);
+                spans.push(status_glyph);
+                spans.push(Span::raw(" "));
+                for (i, k) in key_order.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled("  ", Style::default().fg(COLORS.text_muted)));
+                    }
+                    spans.push(Span::styled(
+                        format!("{}=", k),
+                        Style::default().fg(theme::current_accent()),
+                    ));
+                    let v = c
+                        .values
+                        .get(k)
+                        .map(format_yaml_scalar)
+                        .unwrap_or_else(|| "—".to_string());
+                    spans.push(Span::styled(v, Style::default().fg(COLORS.text)));
+                }
+                if c.is_included {
+                    spans.push(Span::raw("  "));
+                    spans.push(theme::badge_outline("+include", BadgeKind::Warning));
+                }
+                lines.push(Line::from(spans));
+            }
+            if combos.len() > 32 {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  … +{} more", combos.len() - 32),
+                    Style::default().fg(COLORS.text_muted),
+                )]));
+            }
+        }
+        Ok(_) => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "(matrix expanded to 0 combinations — check exclude: or empty axes)",
+                Style::default().fg(COLORS.text_muted),
+            )]));
+        }
+        Err(e) => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                theme::badge_outline("expansion error", BadgeKind::Error),
+                Span::raw(" "),
+                Span::styled(e.to_string(), Style::default().fg(COLORS.text_dim)),
+            ]));
+        }
     }
+
     if !matrix.exclude.is_empty() {
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             format!("EXCLUDE ({})", matrix.exclude.len()),
             Style::default()
@@ -419,7 +500,60 @@ fn render_matrix_pane(
         )]));
     }
 
-    f.render_widget(Paragraph::new(lines), inner_area);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner_area);
+}
+
+fn format_yaml_scalar(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => collapse_newlines(s),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Null => "~".to_string(),
+        other => {
+            // Sequences and maps round-trip to multi-line YAML; each
+            // combo renders into a single ratatui Span, so embedded
+            // newlines would silently garble the layout. Collapse
+            // them into a visible ` · ` separator.
+            let raw = serde_yaml::to_string(other).unwrap_or_default();
+            collapse_newlines(raw.trim())
+        }
+    }
+}
+
+/// Replace any `\n` / `\r` with a visible separator so multi-line
+/// payloads don't break single-Line rendering.
+fn collapse_newlines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_sep = false;
+    for ch in s.chars() {
+        if ch == '\n' || ch == '\r' {
+            if !last_was_sep {
+                out.push_str(" · ");
+                last_was_sep = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_sep = false;
+        }
+    }
+    out
+}
+
+/// Return a small colored glyph indicating what we know about the
+/// parent matrix job's state — per-combo status isn't tracked, so
+/// every row mirrors the parent.
+fn inherited_combo_glyph<'a>(workflow: &'a crate::models::Workflow, job_name: &'a str) -> Span<'a> {
+    let job = workflow
+        .execution_details
+        .as_ref()
+        .and_then(|e| e.jobs.iter().find(|j| j.name == job_name));
+    let (glyph, color) = match job.map(|j| &j.status) {
+        Some(JobStatus::Success) => (theme::symbols::SUCCESS, COLORS.success),
+        Some(JobStatus::Failure) => (theme::symbols::FAILURE, COLORS.error),
+        Some(JobStatus::Skipped) => (theme::symbols::SKIPPED, COLORS.warning),
+        None => (theme::symbols::NOT_STARTED, COLORS.text_muted),
+    };
+    Span::styled(glyph.to_string(), Style::default().fg(color))
 }
 
 // ─── Timeline pane (uses timing component) ────────────────────────

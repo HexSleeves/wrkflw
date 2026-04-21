@@ -1,4 +1,5 @@
 // Status bar — left-aligned key chips, right-aligned runtime + meta.
+use super::{TAB_DAG, TAB_EXECUTION, TAB_HELP, TAB_LOGS, TAB_SECRETS, TAB_TRIGGER, TAB_WORKFLOWS};
 use crate::app::App;
 use crate::models::StatusSeverity;
 use crate::theme::{self, BadgeKind, COLORS};
@@ -94,7 +95,7 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.selected_tab {
-        0 => {
+        TAB_WORKFLOWS => {
             if app.job_selection_mode {
                 vec![
                     ("Enter", "run"),
@@ -124,10 +125,10 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ]
             }
         }
-        1 => {
+        TAB_EXECUTION => {
             if app.detailed_view {
                 vec![
-                    ("Tab", "switch pane"),
+                    ("Tab", "sub-tab"),
                     ("↑↓", "steps"),
                     ("Esc", "back"),
                     ("?", "help"),
@@ -136,20 +137,43 @@ fn context_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 vec![
                     ("j/k", "move"),
                     ("Enter", "inspect"),
-                    ("/", "search"),
-                    ("p", "pause"),
                     ("?", "help"),
+                    ("q", "quit"),
                 ]
             }
         }
-        2 => vec![
+        TAB_DAG => vec![
+            ("g", "graph/list"),
+            ("↑↓", "workflows"),
+            (",", "tweaks"),
+            ("?", "help"),
+        ],
+        TAB_LOGS => vec![
             ("↑↓", "scroll"),
             ("s", "search"),
             ("f", "filter"),
+            ("c", "clear"),
+            ("n", "next match"),
             ("?", "help"),
             ("q", "quit"),
         ],
-        3 => vec![("↑↓", "scroll"), ("?", "close"), ("q", "quit")],
+        TAB_TRIGGER => vec![
+            ("p", "platform"),
+            ("↑↓", "workflow"),
+            ("b", "edit branch"),
+            ("+", "add input"),
+            ("Tab", "next field"),
+            ("Enter", "dispatch"),
+            ("c", "copy curl"),
+            ("?", "help"),
+        ],
+        TAB_SECRETS => vec![
+            ("↑↓", "provider"),
+            ("e", "runtime"),
+            (",", "tweaks"),
+            ("?", "help"),
+        ],
+        TAB_HELP => vec![("↑↓", "scroll"), ("?", "close"), ("q", "quit")],
         _ => vec![],
     }
 }

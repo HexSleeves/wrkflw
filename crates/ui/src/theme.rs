@@ -8,6 +8,29 @@ use ratatui::{
     text::Span,
     widgets::{Block, BorderType, Borders},
 };
+use std::cell::Cell;
+
+thread_local! {
+    /// Per-render accent override. Populated by `set_accent_override`
+    /// at the top of [`crate::views::render_ui`] and consulted by
+    /// [`current_accent`] inside widget builders. Thread-local so each
+    /// ratatui backend thread gets its own value; a `Cell<Option<_>>`
+    /// because renders are single-frame and we never need interior
+    /// sharing — just a scalar handoff.
+    static ACCENT_OVERRIDE: Cell<Option<Color>> = const { Cell::new(None) };
+}
+
+/// Install an accent color for the current frame. Pass `None` to
+/// fall back to [`COLORS.accent`].
+pub fn set_accent_override(color: Option<Color>) {
+    ACCENT_OVERRIDE.with(|c| c.set(color));
+}
+
+/// Read the active accent color. Falls back to the static palette
+/// value when no override is installed.
+pub fn current_accent() -> Color {
+    ACCENT_OVERRIDE.with(|c| c.get()).unwrap_or(COLORS.accent)
+}
 
 // ── Color Palette ──────────────────────────────────────────────────
 
@@ -83,16 +106,6 @@ pub fn title_style() -> Style {
     Style::default()
         .fg(COLORS.highlight)
         .add_modifier(Modifier::BOLD)
-}
-
-pub fn brand_style() -> Style {
-    Style::default()
-        .fg(COLORS.accent)
-        .add_modifier(Modifier::BOLD)
-}
-
-pub fn label_style() -> Style {
-    Style::default().fg(COLORS.accent)
 }
 
 pub fn selected_style() -> Style {
@@ -195,7 +208,7 @@ pub fn block_focused<'a>(title: &'a str) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(COLORS.border_focused))
+        .border_style(Style::default().fg(current_accent()))
         .title(Span::styled(format!(" {} ", title), title_style()))
 }
 
@@ -226,7 +239,9 @@ impl BadgeKind {
             BadgeKind::Warning => COLORS.warning,
             BadgeKind::Trigger => COLORS.trigger,
             BadgeKind::Dim => COLORS.text_dim,
-            BadgeKind::Accent => COLORS.accent,
+            // Resolve dynamically so Tweaks accent changes recolor
+            // `BadgeKind::Accent` call sites in the same frame.
+            BadgeKind::Accent => current_accent(),
             BadgeKind::Highlight => COLORS.highlight,
             BadgeKind::Docker => COLORS.runtime_docker,
             BadgeKind::Podman => COLORS.runtime_podman,
