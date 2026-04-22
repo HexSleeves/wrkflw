@@ -43,6 +43,12 @@ A command-line tool for validating and executing GitHub Actions workflows locall
 cargo install wrkflw
 ```
 
+Or with Homebrew ([formula](https://formulae.brew.sh/formula/wrkflw)):
+
+```bash
+brew install wrkflw
+```
+
 Or build from source:
 
 ```bash
